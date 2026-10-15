@@ -822,6 +822,7 @@ void xbus_write8(uint32_t a, uint8_t v)
  * path: this is only the CPU-visible timing. */
 #define FM_SAMPLE 1008u
 static uint32_t s_fm_count;              /* master clock of the next sample   */
+static uint32_t s_fm_start;              /* first sample time of this frame   */
 static int      s_fm_ta, s_fm_tal = 1024, s_fm_tac, s_fm_tbl = 256 << 4, s_fm_tbc;
 static uint8_t  s_fm_mode, s_fm_status;
 static uint16_t s_fm_addr;
@@ -866,15 +867,40 @@ static void fm_reset_chip(uint32_t t)
     s_fm_tal = 1024;
 }
 
+/* YM access log (GENESIS_FMLOG=from,to,path): frame,cycles,addr,data,fm_count like the
+ * reference's emu/cycle_trace.py --fm-out (addr | 0x100 = status read). */
+static FILE *s_fmlog_f;
+static unsigned long long s_fmlog_from, s_fmlog_to;
+static void fmlog(uint32_t t, unsigned addr, unsigned data)
+{
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("GENESIS_FMLOG");
+        char path[512] = "";
+        if (e && sscanf(e, "%llu,%llu,%511s", &s_fmlog_from, &s_fmlog_to, path) == 3) {
+            s_fmlog_f = fopen(path, "w");
+            if (s_fmlog_f) fprintf(s_fmlog_f, "frame,cycles,addr,data,fm_count,tac,tbc\n");
+        }
+    }
+    if (s_fmlog_f && s_frame_no >= s_fmlog_from && s_frame_no <= s_fmlog_to) {
+        fprintf(s_fmlog_f, "%llu,%u,%03X,%02X,%u,%d,%d\n", (unsigned long long)s_frame_no, t, addr, data,
+                s_fm_count, s_fm_tac, s_fm_tbc);
+        fflush(s_fmlog_f);
+    }
+}
+
 uint8_t exact_ym_read(uint32_t t)
 {
     fm_update(t);
+    fmlog(t, 0x100, s_fm_status);
     return s_fm_status;
 }
 
 void exact_ym_write(uint32_t t, unsigned port, uint8_t v)
 {
     if (port & 1) fm_update(t);
+    fmlog(t, port & 3, v);
     switch (port & 3) {
     case 0: s_fm_addr = v; break;
     case 2: s_fm_addr = (uint16_t)(v | 0x100); break;
@@ -916,7 +942,7 @@ void exact_reset(void)
     s_pad_counter[0] = s_pad_counter[1] = 0;
     s_pad_timeout[0] = s_pad_timeout[1] = 0;
     s_zclk = 0; s_zstate = 0; s_zirq = 0; s_zaccess = 0;
-    s_fm_count = 0; s_fm_ta = 0; s_fm_tal = 1024; s_fm_tac = 0; s_fm_tbl = 256 << 4; s_fm_tbc = 0;
+    s_fm_count = 0; s_fm_start = 0; s_fm_ta = 0; s_fm_tal = 1024; s_fm_tac = 0; s_fm_tbl = 256 << 4; s_fm_tbc = 0;
     s_fm_mode = 0x30; s_fm_status = 0; s_fm_addr = 0;
     { extern void machine_z80_exact_power_on(void); machine_z80_exact_power_on(); }
     g_machine.bus.z80_busreq = 0; g_machine.bus.z80_reset_off = 0;
@@ -1005,8 +1031,17 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     } while (++line < LINES - 1);
 
     v->in_vblank = 0;
-    fm_update(s_mline);                            /* the frame's last FM samples */
-    s_fm_count -= s_mline;
+    /* The frame's last FM samples, then the sample clock re-anchors to the first
+     * sample boundary at or after the frame end, counted from the frame's first
+     * sample (at least one). A late Z80 access that already ran the chip past
+     * the frame end has that sample run again next frame, as in the reference. */
+    fm_update(s_mline);
+    {
+        uint32_t span = s_mline > s_fm_start ? s_mline - s_fm_start : 0;
+        uint32_t k = (span + FM_SAMPLE - 1) / FM_SAMPLE;
+        if (k == 0) k = 1;
+        s_fm_count = s_fm_start = s_fm_start + k * FM_SAMPLE - s_mline;
+    }
     g_xclk   -= s_mline;
     g_xstart -= s_mline;
     s_zclk   -= s_mline;

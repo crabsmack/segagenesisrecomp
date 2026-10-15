@@ -498,14 +498,10 @@ void machine_render_line(int line, GenesisScanlineSink sink, void *user)
  * comparable with the reference's emu/cycle_trace.py --z80-out. */
 static FILE    *s_ztrace_f;
 static unsigned long long s_ztrace_on;   /* frame number while tracing, else 0 */
-/* Z80 time during an exact step: the instruction's cycles are charged before it
- * executes (as in the reference), so an access happens at its end. */
-static uint32_t      s_znow_base;
-static unsigned long s_znow_cyc;
-uint32_t machine_z80_now(void)
-{
-    return s_znow_base + (uint32_t)(g_machine.z80.cyc - s_znow_cyc) * MASTER_PER_Z80;
-}
+/* Z80 time during an exact step: the reference charges an instruction's base
+ * cost before executing it, so every bus access happens at start + base. */
+static uint32_t s_znow;
+uint32_t machine_z80_now(void) { return s_znow; }
 static unsigned long long s_ztrace_from, s_ztrace_to;
 void machine_z80_trace_frame(unsigned long long frame)
 {
@@ -560,7 +556,7 @@ void machine_z80_exact_step(uint32_t *zclk, uint32_t target)
         }
         if (s_ztrace_on) z80_trace_one(&m->z80, *zclk);
         unsigned long c0 = m->z80.cyc;
-        s_znow_base = *zclk; s_znow_cyc = c0;
+        s_znow = *zclk + z80_base_cycles(&m->z80) * MASTER_PER_Z80;
         ei_shadow = z80_exec_one(&m->z80);
         *zclk += (uint32_t)(m->z80.cyc - c0) * MASTER_PER_Z80;
 #endif
