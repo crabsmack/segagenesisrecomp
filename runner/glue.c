@@ -442,6 +442,7 @@ void glue_reset_frame_sync(void)
 static int s_in_vblank_service = 0;
 
 #include "game_spec.h"      /* g_game_spec.call_entry_point / vblank / hblank / periodic */
+#include "exact_sched.h"    /* g_exact, xbus_* (cycle-exact mode) */
 
 
 void glue_log_frame_state(uint64_t frame);  /* defined below */
@@ -598,6 +599,7 @@ static void game_fiber_func(void *param)
                   | ((uint32_t)g_rom[2] <<  8)
                   |  (uint32_t)g_rom[3];
     g_cpu.SR  = 0x2700u;
+    if (g_exact) g_cpu.SR = 0x2704u;   /* post-reset Z flag, as the reference reports */
 
     if (genesis_force_interp()) {
         uint32_t entry = m68k_read32(4) & 0xFFFFFFu;   /* 68K reset vector */
@@ -674,6 +676,25 @@ static int     s_interleave_active = 0;
 
 /* Called from DoCycles (inside Iterate). Runs game code for a chunk. */
 static cc_u32f s_chunk_cycles = 0;  /* budget for current chunk */
+
+/* ---- Exact timing (runner/exact_sched.c) ----------------------------------
+ * The exact scheduler runs the game fiber until the generated code's XI()
+ * boundary finds the time slice spent and parks it. No budget, spin, poll or
+ * WaitForVBlank heuristics apply in that mode. */
+#include "exact_sched.h"
+int glue_exact_running(void) { return s_game_running && s_game_fiber != NULL; }
+void glue_exact_resume(void)
+{
+    if (!glue_exact_running()) return;
+    instruction_watchdog_reset();
+    fiber_switch(s_game_fiber);
+    instruction_watchdog_reset();
+}
+void glue_exact_park(void)
+{
+    { char stack_marker; game_stack_note("exact-slice", &stack_marker); }
+    yield_to_main(GLUE_YIELD_BUDGET);
+}
 
 void glue_run_game_chunk(cc_u32f cycles)
 {
@@ -1329,6 +1350,7 @@ uint64_t g_cvblank_fires_total = 0;
 
 void glue_check_vblank(void)
 {
+    if (g_exact) return;
     instruction_watchdog_check();
 
     /* Own backend: the scanline scheduler (machine_run_frame) is the SOLE
@@ -1364,6 +1386,7 @@ void glue_check_vblank(void)
 
 void glue_end_of_wall_frame(void)
 {
+    if (g_exact) return;   /* the exact scheduler delivers every V-int itself */
     /* Hardware fires VBla every wall frame regardless of what 68K code
      * is doing. If nothing has fired the handler this wall frame (game
      * accumulator didn't reach threshold AND the yield path didn't
@@ -1610,6 +1633,7 @@ static inline void spin_check(uint32_t byte_addr, int is_write)
 
 uint16_t m68k_read16(uint32_t byte_addr)
 {
+    if (g_exact) return xbus_read16(byte_addr);
     byte_addr &= 0xFFFFFFu;
     watchdog_check(byte_addr, 0, 0);
     bus_ring_push(byte_addr, 1);
@@ -1632,6 +1656,7 @@ static uint32_t s_z80poll_last_addr = 0;
 static int      s_z80poll_streak    = 0;
 uint8_t m68k_read8(uint32_t byte_addr)
 {
+    if (g_exact) return xbus_read8(byte_addr);
     byte_addr &= 0xFFFFFFu;
     watchdog_check(byte_addr, 0, 0);
     bus_ring_push(byte_addr, 0);
@@ -1692,6 +1717,10 @@ uint8_t m68k_read8(uint32_t byte_addr)
 
 uint32_t m68k_read32(uint32_t byte_addr)
 {
+    if (g_exact) {
+        uint16_t hi = xbus_read16(byte_addr);
+        return ((uint32_t)hi << 16) | xbus_read16(byte_addr + 2u);
+    }
     byte_addr &= 0xFFFFFFu;
     watchdog_check(byte_addr, 0, 0);
     bus_ring_push(byte_addr, 2);
@@ -1706,6 +1735,7 @@ uint32_t m68k_read32(uint32_t byte_addr)
 
 void m68k_write16(uint32_t byte_addr, uint16_t val)
 {
+    if (g_exact) { xbus_write16(byte_addr, val); return; }
     byte_addr &= 0xFFFFFFu;
     watchdog_check(byte_addr, 1, val);
     bus_ring_push(byte_addr, 4);
@@ -1724,6 +1754,7 @@ void m68k_write16(uint32_t byte_addr, uint16_t val)
 
 void m68k_write8(uint32_t byte_addr, uint8_t val)
 {
+    if (g_exact) { xbus_write8(byte_addr, val); return; }
     byte_addr &= 0xFFFFFFu;
     watchdog_check(byte_addr, 1, val);
     bus_ring_push(byte_addr, 3);
@@ -1743,6 +1774,7 @@ void m68k_write8(uint32_t byte_addr, uint8_t val)
 
 void m68k_write32(uint32_t byte_addr, uint32_t val)
 {
+    if (g_exact) { xbus_write16(byte_addr, (uint16_t)(val >> 16)); xbus_write16(byte_addr + 2u, (uint16_t)val); return; }
     byte_addr &= 0xFFFFFFu;
     watchdog_check(byte_addr, 1, (uint32_t)(val >> 16));
     bus_ring_push(byte_addr, 5);

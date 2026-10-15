@@ -3038,6 +3038,15 @@ session_begin:;
                                    g_app_config.rewind_interval);
     audio_set_playback_enabled(!turbo);
     uint32_t frame_num = 0;
+    /* The script is ticked after each frame with that frame's number, so its
+     * first directives would only reach frame 2. In exact mode (a recorded
+     * per-frame input stream replayed against a reference) tick once before
+     * the first frame: directive time 0 then means "for frame 1". */
+    {
+        extern int g_exact;
+        if (g_exact && input_script_active())
+            input_script_tick(0, glue_peek8, glue_peek16, glue_poke8, glue_poke16, glue_poke32);
+    }
     int      mode_prev = -1;     /* --hash-on-mode: last Game_Mode seen (-1 = none yet) */
     uint32_t mode_seq  = 0;      /* --hash-on-mode: transition sequence counter */
     const Uint64 perf_frequency = SDL_GetPerformanceFrequency();
