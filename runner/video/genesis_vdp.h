@@ -165,6 +165,11 @@ uint16_t gvdp_peek_status(const GVDP *v);
 uint32_t gvdp_rb_pending_stall(void);
 void     gvdp_rb_set_pending_stall(uint32_t v);
 uint32_t gvdp_consume_68k_stall(GVDP *v);
+/* Raw VRAM (odd address = byte-swapped word) / CRAM / VSRAM stores, no
+   auto-increment: the exact scheduler's port layer (runner/exact_sched.c). */
+void gvdp_store_vram_word(GVDP *v, uint16_t addr, uint16_t value);
+void gvdp_store_cram(GVDP *v, uint16_t addr, uint16_t value);
+void gvdp_store_vsram(GVDP *v, uint16_t addr, uint16_t value);
 
 /* ---- Always-on VDP event ring ---------------------------------------------
  * Port-level flight recorder: every register write, completed control

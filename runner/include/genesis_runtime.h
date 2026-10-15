@@ -246,6 +246,64 @@ void cosim_checkpoint(void);        /* hash + park; advances g_cosim_next_cp    
 #define GEN_COSIM_TICK(n) ((void)0)
 #endif
 
+/* ---- Exact timing (game.toml exact_timing; runner/exact_sched.c) --------
+ * Every generated instruction starts with XI(pc, cost): a boundary where the
+ * scheduler may end the 68000's time slice or take an interrupt, then the
+ * instruction's cost in master clocks (7 per 68000 cycle). XC adds a
+ * data-dependent cost; XSR requests an interrupt check after an SR write. */
+extern uint32_t g_xclk, g_xstart, g_xend, g_xpc;
+extern uint32_t g_xrts;    /* where the last RTS returned (68000 stack), exact mode */
+extern int      g_xtrace;
+void x68k_slice(uint32_t pc);
+void x68k_sr_written(void);
+void x68k_trace(uint32_t pc);
+void x68k_divide_by_zero(uint32_t next_pc);
+#define XI(pc, c) do { if (g_xclk >= g_xend) x68k_slice(pc); g_xpc = (pc); \
+    g_xstart = g_xclk; if (g_xtrace) x68k_trace(pc); g_xclk += (c); } while (0)
+#define XC(c) (g_xclk += (uint32_t)(int32_t)(c))
+#define XSR() x68k_sr_written()
+/* Operand-dependent MUL/DIV time in master clocks (the standard 68000 timing
+ * algorithms: MULU 38+2n for n set bits, MULS 38+2n for n 01/10 pairs, DIVU
+ * and DIVS per the shift-subtract microcode). */
+static inline uint32_t x68k_mulu_mclk(uint16_t s)
+{
+    uint32_t c = 38;
+    while (s) { c += (s & 1) * 2; s >>= 1; }
+    return c * 7u;
+}
+static inline uint32_t x68k_muls_mclk(int16_t s)
+{
+    uint32_t c = 38, t = (((uint32_t)(uint16_t)s << 1) ^ (uint16_t)s) & 0xFFFFu;
+    while (t) { c += (t & 1) * 2; t >>= 1; }
+    return c * 7u;
+}
+static inline uint32_t x68k_divu_mclk(uint32_t dst, uint32_t src)
+{
+    uint32_t m = 38 * 7;
+    src <<= 16;
+    for (int i = 0; i < 15; i++) {
+        if ((int32_t)dst < 0) { dst <<= 1; dst -= src; }
+        else { dst <<= 1; m += 2 * 7; if (dst >= src) { dst -= src; m -= 7; } }
+    }
+    return m << 1;
+}
+static inline uint32_t x68k_divs_mclk(int32_t dst, int16_t src)
+{
+    uint32_t m = 6 * 7;
+    uint32_t ad = dst < 0 ? (uint32_t)0 - (uint32_t)dst : (uint32_t)dst;
+    uint32_t as = src < 0 ? (uint32_t)(-(int32_t)src) : (uint32_t)src;
+    if (dst < 0) m += 7;
+    if ((ad >> 16) < as) {
+        uint32_t q = ad / as;
+        m += 55 * 7;
+        if (src >= 0) { if (dst >= 0) m -= 7; else m += 7; }
+        for (int i = 0; i < 15; i++) { q >>= 1; if (!(q & 1)) m += 7; }
+    } else {
+        m += 2 * 7;
+    }
+    return m << 1;
+}
+
 /* ---- Controller ---- */
 /* 3-button pad bitmask: bit5=C, bit4=B, bit3=A,
  *   bit2=Start, bit1=Up, bit0=Down (bit6=Left? depends on read mode)

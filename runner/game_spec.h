@@ -85,6 +85,9 @@ typedef struct GameSpec {
      * per game once validated (RKA: on; Sonics ship with full disasm
      * coverage and keep it off so a miss stays a loud regression). */
     int         tier3_floor_default;
+    /* Cycle-exact timing (runner/exact_sched.h). Requires generated code
+     * built with game.toml exact_timing = true. 0 = the default scheduler. */
+    int         exact_timing;
 
     /* Optional statically-recompiled Z80 coprocessor backend. The generated
      * function executes exactly one instruction from the explicit Z80 PC and

@@ -182,6 +182,11 @@ static void vsram_write(GVDP *v, uint16_t addr, uint16_t value)
     if (idx < GVDP_VSRAM_ENTRIES) v->vsram[idx] = value & 0x07FF;  /* 11-bit cells */
 }
 
+/* Raw stores for runner/exact_sched.c, which owns the port/DMA timing. */
+void gvdp_store_vram_word(GVDP *v, uint16_t addr, uint16_t value) { vram_write_word(v, addr, value); }
+void gvdp_store_cram(GVDP *v, uint16_t addr, uint16_t value)      { cram_write(v, addr, value); }
+void gvdp_store_vsram(GVDP *v, uint16_t addr, uint16_t value)     { vsram_write(v, addr, value); }
+
 /* ---- DMA ------------------------------------------------------------------ */
 static uint32_t dma_length(const GVDP *v)
 {

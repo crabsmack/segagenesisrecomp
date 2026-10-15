@@ -268,6 +268,13 @@ typedef struct {
      * validates its candidate alias set. The analyzer still reports candidates
      * when disabled; established function boundaries remain unchanged. */
     bool           function_aliases;
+    /* Opt-in cycle-exact timing (runner/exact_sched.c): every instruction starts
+     * with XI(pc, cost) — a slice/interrupt boundary check plus the instruction's
+     * exact 68000 cost in master clocks — and data-dependent costs (untaken
+     * branches, DBcc, Scc, register-count shifts, MUL/DIV) are charged inline.
+     * Replaces the per-instruction accounting and the WaitForVBlank/poll-loop
+     * yield heuristics. Default false. */
+    bool           exact_timing;
     /* Widescreen (16:9) injection sites, from [[widescreen_site]] in game.toml.
      * Consumed at codegen time (not emitted to the runtime layout). Empty =>
      * no widescreen injection for this game. */

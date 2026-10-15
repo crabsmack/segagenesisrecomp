@@ -216,6 +216,9 @@ static void machine_wire_pointers(void)
     g_machine.z80.userdata       = &g_machine.bus;
 }
 
+#include "exact_sched.h"
+#include "game_spec.h"
+
 void machine_init(void)
 {
     memset(&g_machine, 0, sizeof(g_machine));
@@ -230,6 +233,8 @@ void machine_init(void)
 #endif
     /* Widescreen black-bar pillarbox colour (opaque black). */
     s_cram_argb[GVDP_WS_BAR_INDEX] = 0xFF000000u;
+    g_exact = g_game_spec.exact_timing;
+    if (g_exact) exact_reset();
 }
 
 /* ---- Own-backend save states ----------------------------------------------
@@ -466,9 +471,67 @@ static void step_z80(GenesisMachine *m, uint32_t target)
 #endif
 }
 
+/* ---- Exact-timing support (runner/exact_sched.c) -------------------------- */
+/* Render one active line (index buffer always; ARGB + sink when presenting). */
+void machine_render_line(int line, GenesisScanlineSink sink, void *user)
+{
+    static uint8_t  idxbuf[GVDP_MAX_WIDTH];
+    static uint32_t rowbuf[GVDP_MAX_WIDTH];
+    GenesisMachine *m = &g_machine;
+    int dbl = gvdp_interlace_double(&m->vdp);
+    for (int sub = 0; sub <= dbl; sub++) {
+        int row = (line << dbl) + sub;
+        int n = gvdp_render_scanline(&m->vdp, row, idxbuf);
+        if (!sink) continue;
+        const uint32_t *host_palette = gvdp_host_palette();
+        if (host_palette)
+            memcpy(s_cram_argb + GVDP_HOST_PALETTE_BASE, host_palette,
+                   GVDP_HOST_PALETTE_SIZE * sizeof(uint32_t));
+        for (int x = 0; x < n; x++) rowbuf[x] = s_cram_argb[idxbuf[x]];
+        sink(user, row, rowbuf, n);
+    }
+}
+
+/* Run the Z80 to master clock `target` (15 master clocks per T-state). */
+void machine_z80_exact_step(uint32_t *zclk, uint32_t target)
+{
+    GenesisMachine *m = &g_machine;
+    while (*zclk < target) {
+        s_line_base = 0;
+        s_z80_off = *zclk;                 /* audio stamp: frame-relative master */
+#ifdef GENESIS_Z80_RECOMP
+        *zclk += z80_recomp_step_one() * MASTER_PER_Z80;
+#else
+        unsigned long c0 = m->z80.cyc;
+        z80_step(&m->z80);
+        *zclk += (uint32_t)(m->z80.cyc - c0) * MASTER_PER_Z80;
+#endif
+    }
+}
+
+void machine_z80_exact_reset(void)
+{
+#ifdef GENESIS_Z80_RECOMP
+    z80_recomp_reset();
+    z80_recomp_mirror_to_interpreter(&g_machine.z80);
+#else
+    z80_own_reset(&g_machine.z80);
+#endif
+}
+
+void machine_z80_exact_irq(int asserted)
+{
+#ifdef GENESIS_Z80_RECOMP
+    if (asserted) z80_recomp_assert_irq();
+#else
+    g_machine.z80.int_pending = asserted ? 1 : 0;
+#endif
+}
+
 void machine_run_frame(GenesisScanlineSink sink, void *user)
 {
     GenesisMachine *m = &g_machine;
+    if (g_exact) { exact_run_frame(sink, user); g_snd_frame++; return; }
     int active_h = gvdp_screen_height(&m->vdp);
     static uint8_t  idxbuf[GVDP_MAX_WIDTH];
     static uint32_t rowbuf[GVDP_MAX_WIDTH];
