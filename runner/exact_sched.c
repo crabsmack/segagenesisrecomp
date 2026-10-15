@@ -36,7 +36,9 @@ void (*g_xinsn_hook)(uint32_t pc);
 uint64_t g_xirq_taken;
 
 /* Logical positions (see "Logical positions" below). */
-static int s_stepped;            /* GameSpec.stepped: untimed code, replayed   */
+static int s_stepped;            /* GameSpec.stepped: untimed code             */
+static int s_replay;             /* stepped, replaying a timed run's log       */
+static int s_fsync;              /* stepped, frame-synchronous (no log)        */
 static int s_depth;              /* 0 = main program, n = n nested interrupts  */
 static void pos_irq_enter(unsigned level);
 static void pos_irq_leave(void);
@@ -262,12 +264,13 @@ void x68k_slice(uint32_t pc)
     g_xend = s_end;
 }
 
-void x68k_sr_pre(void) { if (s_stepped) rp_take_pending(); }
+void x68k_sr_pre(void) { if (s_replay) rp_take_pending(); }
 
 void x68k_sr_written(void)
 {
 
-    if (s_stepped) { rp_take_pending(); return; }   /* an unmasked replayed interrupt */
+    if (s_replay) { rp_take_pending(); return; }    /* an unmasked replayed interrupt */
+    if (s_stepped) return;
     s_check_now = 1;
     force_boundary();
 }
@@ -295,25 +298,31 @@ static void fm_update(uint32_t t);
 
 static void z80_run(uint32_t target)
 {
-    /* Stepped: no clock, and every 68000 read of the Z80 area is replayed. */
+    /* Stepped: no clock (replay: the 68000's Z80 reads are replayed; frame-synchronous: the
+       Z80 runs a frame at each sync point and a slice whenever the 68000 releases its bus). */
     if (s_zstate == 1 && !s_stepped) machine_z80_exact_step(&s_zclk, target);
     else               s_zclk = target;
 }
 
 static void z80_busreq_w(int req, uint32_t now)
 {
+    if (s_fsync) now = s_zclk;               /* no 68000 clock: the Z80's own */
     if (req) {
         if (s_zstate == 1) { z80_run(now); s_zaccess = 1; }
         s_zstate |= 2;
     } else {
         if (s_zstate == 3) { s_zclk = now; s_zaccess = 0; }
         s_zstate &= 1;
+        /* frame-synchronous: a released Z80 runs a fixed slice, so a 68000 waiting for the
+           sound driver's answer sees it after a deterministic number of polls */
+        if (s_fsync && s_zstate == 1) machine_z80_exact_step(&s_zclk, s_zclk + 8u * MPL);
     }
     g_machine.bus.z80_busreq = (uint8_t)((s_zstate & 2) ? 1 : 0);
 }
 
 static void z80_reset_w(int release, uint32_t now)
 {
+    if (s_fsync) now = s_zclk;
     if (release) {
         if (s_zstate == 0) { s_zclk = now; machine_z80_exact_reset(); fm_reset_chip(now); }
         else if (s_zstate == 2) { s_zaccess = 1; machine_z80_exact_reset(); fm_reset_chip(now); }
@@ -1113,11 +1122,14 @@ static void pos_irq_leave(void)
     s_pos[s_depth].ev += handler;
 }
 
+static void fsync_vint(void);
+static void fsync_z80_frame(void);
+
 static void sync_point(void)
 {
     uint64_t frame = s_frame_no;
     s_sync_no++;
-    if (s_stepped) {
+    if (s_replay) {
         if (s_rec.type != 'S') rp_divergence("sync point the reference did not reach here");
         if (s_rec.sync != s_sync_no || s_rec.entries != s_pos[0].entries)
             rp_divergence("sync point at a different position");
@@ -1130,12 +1142,13 @@ static void sync_point(void)
     }
     if (g_game_spec.on_sync) g_game_spec.on_sync(s_sync_no, frame);
     if (s_stepped) glue_exact_park();          /* one runner frame per sync interval */
+    if (s_fsync) fsync_vint();                 /* frame-synchronous: the V-int is taken here */
 }
 
 int x68k_entry(uint32_t addr)
 {
     if (is_game_function(addr)) {
-        if (s_stepped) {
+        if (s_replay) {
             rp_take_pending();
             if (s_depth == 0 && s_rec.type == 'X' && s_pos[0].entries + 1 > s_rec.entries) rp_finish();
         }
@@ -1146,15 +1159,19 @@ int x68k_entry(uint32_t addr)
         s_last_entry = addr;
         if (s_stepped || s_rp_out) rp_trace("entry", addr);
         if (s_depth == 0 && addr == g_game_spec.sync_pc) sync_point();
-        if (s_stepped) rp_take_pending_at(1);
+        if (s_replay) rp_take_pending_at(1);
     }
     return g_game_spec.on_entry ? g_game_spec.on_entry(addr) : 0;
 }
 
+static uint16_t fsync_read(uint32_t a, uint8_t size);
+
 static uint16_t hw_read(uint32_t a, uint8_t size)
 {
     uint16_t v;
-    if (s_stepped) {
+    if (s_fsync) {
+        v = fsync_read(a, size);
+    } else if (s_replay) {
         rp_take_pending();
         if (s_rec.type == 'X') rp_finish();
         if (s_rec.type != 'R') {
@@ -1185,9 +1202,58 @@ static uint16_t hw_read(uint32_t a, uint8_t size)
     }
     s_pos[s_depth].reads++;
     s_pos[s_depth].ev = g_xinsn;
-    if (s_stepped) rp_take_pending_at(1);
+    if (s_replay) rp_take_pending_at(1);
     return v;
 }
+
+/* ---- frame-synchronous stepped mode (no replay log) ------------------------
+ * xmen2disasm P4-decomp.md decision 5: one sync interval per runner frame; at each sync point,
+ * after its row, the V-int is taken (when enabled and unmasked); the pads come from the input
+ * script (ticked per runner frame); hardware is emulated without timing. Every rule depends
+ * only on the program's own hardware accesses, so a function in C and its generated version
+ * see the same machine. */
+static int s_fs_vblank;              /* the VDP status shows VBLANK (after one clear read)     */
+static uint64_t s_fs_reads;          /* hardware reads since the last sync point (hang guard)  */
+
+static void fsync_vint(void)
+{
+    s_fs_vblank = 0;
+    s_fs_reads = 0;
+    if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) take_interrupt(g_xpc, 6);
+}
+
+
+static uint16_t fsync_read(uint32_t a, uint8_t size)
+{
+    if (++s_fs_reads > 20000000u) {
+        fprintf(stderr, "[stepped] no sync point after %llu hardware reads: stuck polling $%06X in $%06X "
+                        "(sync %llu, Z80 state %d)\n", (unsigned long long)s_fs_reads, (unsigned)a,
+                (unsigned)s_last_entry, (unsigned long long)s_sync_no, s_zstate);
+        fflush(stderr);
+        exit(3);
+    }
+    if (vdp_port(a)) {
+        switch (a & 0x1C) {
+        case 0x00: {
+            uint16_t w = vdp_data_r();
+            return size == 1 ? (uint16_t)((a & 1) ? (w & 0xFF) : (w >> 8)) : w;
+        }
+        case 0x04: {
+            /* FIFO empty, no DMA in progress; VBLANK alternates from read to read, clear first
+               after a sync point, so any wait for the bit to change ends at the next read
+               (VDP_WaitVBlank: clear, then set) */
+            (void)vdp_ctrl_r(g_xstart);         /* the read's effect on the command latch */
+            uint16_t w = (uint16_t)(0x7200 | (s_fs_vblank ? 0x08 : 0x00) | (!(REG(1) & 0x40) ? 0x08 : 0x00));
+            s_fs_vblank ^= 1;
+            return size == 1 ? (uint16_t)((a & 1) ? (w & 0xFF) : (w >> 8)) : w;
+        }
+        default:
+            return 0;                           /* H/V counter: no beam without time */
+        }
+    }
+    return size == 1 ? dev_read8(a) : dev_read16(a);
+}
+
 
 static void positions_init(void)
 {
@@ -1196,9 +1262,13 @@ static void positions_init(void)
     done = 1;
     s_stepped = g_game_spec.stepped;
     const char *out = getenv("GENESIS_REPLAY_OUT"), *in = getenv("GENESIS_REPLAY_IN");
-    if (s_stepped) {
-        if (!in || !*in || !(s_rp_in = fopen(in, "rb"))) {
-            fprintf(stderr, "[replay] stepped build: GENESIS_REPLAY_IN must name a replay log\n");
+    if (s_stepped && !(in && *in)) {
+        s_fsync = 1;                      /* frame-synchronous (the phase-4 D2/D6 runner) */
+        s_rp_hw = 1;
+    } else if (s_stepped) {
+        s_replay = 1;
+        if (!(s_rp_in = fopen(in, "rb"))) {
+            fprintf(stderr, "[replay] cannot read GENESIS_REPLAY_IN %s\n", in);
             exit(2);
         }
         setvbuf(s_rp_in, NULL, _IOFBF, 1 << 20);
@@ -1421,6 +1491,25 @@ void exact_ym_write(uint32_t t, unsigned port, uint8_t v)
 /* ======================================================================== */
 /* Frame                                                                     */
 
+/* The Z80's frame: its V-int line for one line, the rest of the frame, then the YM sample
+   clock re-anchors (as exact_run_frame does). Time inside a frame is the Z80's own. */
+static void fsync_z80_frame(void)
+{
+    const uint32_t F = LINES * MPL;
+    for (int i = 0; i < 262; i++) input_refresh();
+    if (s_zstate == 1) { machine_z80_exact_irq(1); if (s_zclk < MPL) machine_z80_exact_step(&s_zclk, MPL); machine_z80_exact_irq(0); }
+    if (s_zstate == 1 && s_zclk < F) machine_z80_exact_step(&s_zclk, F);
+    if (s_zclk < F) s_zclk = F;
+    fm_update(F);
+    {
+        uint32_t span = F > s_fm_start ? F - s_fm_start : 0;
+        uint32_t k = (span + FM_SAMPLE - 1) / FM_SAMPLE;
+        if (k == 0) k = 1;
+        s_fm_count = s_fm_start = s_fm_start + k * FM_SAMPLE - F;
+    }
+    s_zclk -= F;
+}
+
 void exact_reset(void)
 {
     g_xclk = g_xstart = 40u * MCLK_68K;   /* reset exception */
@@ -1478,6 +1567,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
 
     if (s_stepped) {                  /* no clock: run to the next sync point */
         s_frame_no++;
+        if (s_fsync) fsync_z80_frame();
         if (!s_rp_done) glue_exact_resume();
         (void)sink; (void)user;
         return;
