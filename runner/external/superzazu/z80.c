@@ -770,6 +770,27 @@ void z80_step(z80* const z) {
   process_interrupts(z);
 }
 
+// The next instruction's cost before any conditional extra (taken branches,
+// repeating block instructions), from its opcode bytes. A MAME-style core
+// charges this up front, so bus accesses during the instruction happen at
+// start + this; exact schedulers timestamp accesses with it.
+unsigned z80_base_cycles(z80* const z) {
+  if (z->halted) return 4;
+  uint8_t b0 = rb(z, z->pc);
+  if (b0 == 0xCB) {
+    uint8_t op = rb(z, (uint16_t)(z->pc + 1));
+    if ((op & 7) != 6) return 8;
+    return ((op >> 6) == 1) ? 12 : 15;
+  }
+  if (b0 == 0xED) return cyc_ed[rb(z, (uint16_t)(z->pc + 1))];
+  if (b0 == 0xDD || b0 == 0xFD) {
+    uint8_t op = rb(z, (uint16_t)(z->pc + 1));
+    if (op == 0xCB) return ((rb(z, (uint16_t)(z->pc + 3)) >> 6) == 1) ? 20 : 23;
+    return cyc_ddfd[op];
+  }
+  return cyc_00[b0];
+}
+
 // MAME-order stepping (segagenesisrecomp exact timing). The caller checks for
 // a maskable interrupt BEFORE each instruction with z80_take_irq (returns 1 if
 // one was taken: halt left, flip-flops cleared, mode 1/2/0 entry with its
