@@ -387,6 +387,8 @@ bool game_config_load(GameConfig *cfg, const char *path) {
         cfg->jump_table_autodiscovery = toml_bool_or(game, "jump_table_autodiscovery", false);
         cfg->function_aliases         = toml_bool_or(game, "function_aliases", false);
         cfg->exact_timing             = toml_bool_or(game, "exact_timing", false);
+        cfg->untimed                  = toml_bool_or(game, "untimed", false);
+        cfg->entry_hooks              = toml_bool_or(game, "entry_hooks", false);
         cfg->runtime_table_promotions = toml_bool_or(game, "runtime_table_promotions", false);
 
         /* code_addrs_file: flat text list (one hex instruction-start addr per

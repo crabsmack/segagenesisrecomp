@@ -27,7 +27,22 @@ uint32_t g_xstart = 0;     /* 68000 time at the start of the current instruction
 uint32_t g_xend   = 0;     /* boundary trigger: s_end, or 0 to force a check    */
 uint32_t g_xpc    = 0;     /* address of the current instruction               */
 uint32_t g_xrts   = 0;     /* 68000 return target of the last RTS               */
+uint32_t g_xa7min = 0xFFFFFFFFu; /* lowest A7 at any instruction boundary       */
 int      g_xtrace = 0;
+
+/* Verification hooks (genesis_runtime.h). */
+int  (*g_xhw_hook)(uint32_t addr, int size, int kind, uint16_t v, uint16_t *out);
+void (*g_xinsn_hook)(uint32_t pc);
+uint64_t g_xirq_taken;
+
+/* Logical positions (see "Logical positions" below). */
+static int s_stepped;            /* GameSpec.stepped: untimed code, replayed   */
+static int s_depth;              /* 0 = main program, n = n nested interrupts  */
+static void pos_irq_enter(unsigned level);
+static void pos_irq_leave(void);
+static void rp_take_pending(void);
+static uint8_t *s_shared;
+static void shared_dump(void);
 
 static uint32_t s_end;     /* end of the current 68000 time slice              */
 static uint32_t s_mline;   /* master clock at the start of the current line    */
@@ -99,6 +114,7 @@ void x68k_trace(uint32_t pc)
     /* The reference runs the instruction in an IRQ-latency slot inline, without
      * its per-instruction hook; leave it out here too so the traces align. */
     if (s_irq_latency == 2 && pc == s_irq_latency_pc) return;
+    if (g_xinsn_hook) g_xinsn_hook(pc);
     if (s_trace_f) {
         uint32_t h = 2166136261u;   /* word-wise FNV-1a over D0-D7/A0-A7 */
         for (int i = 0; i < 8; i++) h = (h ^ g_cpu.D[i]) * 16777619u;
@@ -128,8 +144,8 @@ static void trace_frame_begin(void)
         }
     }
     if (s_trace_f) fflush(s_trace_f);   /* exit paths may skip stdio teardown */
-    g_xtrace = s_trace_f && s_frame_no >= s_trace_from && s_frame_no <= s_trace_to;
-    if (s_trace_f && s_frame_no > s_trace_to) { fclose(s_trace_f); s_trace_f = NULL; g_xtrace = 0; }
+    g_xtrace = (s_trace_f && s_frame_no >= s_trace_from && s_frame_no <= s_trace_to) || g_xinsn_hook != NULL;
+    if (s_trace_f && s_frame_no > s_trace_to) { fclose(s_trace_f); s_trace_f = NULL; g_xtrace = g_xinsn_hook != NULL; }
 }
 
 /* ======================================================================== */
@@ -185,6 +201,7 @@ static void take_interrupt(uint32_t pc, unsigned level)
     g_cpu.SR = (uint16_t)((sr & ~0x8000u) | 0x2000u);        /* S set, T clear */
     g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0700u) | (level << 8));
     irq_ack(level);
+    g_xirq_taken++;
     uint32_t vec = m68k_read32((24u + level) * 4u) & 0xFFFFFFu;
     g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], pc & 0xFFFFFFu);
     g_cpu.A[7] -= 2; m68k_write16(g_cpu.A[7], sr);
@@ -194,7 +211,9 @@ static void take_interrupt(uint32_t pc, unsigned level)
     g_rte_pending = 0;
     int saved_split = g_split_sp_popped;   /* isolate the interrupted split chain */
     g_split_sp_popped = 0;
+    pos_irq_enter(level);
     recomp_call_addr(vec);
+    pos_irq_leave();
     g_split_sp_popped = saved_split;
     if (!g_rte_pending) {
         fprintf(stderr, "[exact] interrupt handler $%06X returned without RTE (pc $%06X)\n",
@@ -243,7 +262,15 @@ void x68k_slice(uint32_t pc)
     g_xend = s_end;
 }
 
-void x68k_sr_written(void) { s_check_now = 1; force_boundary(); }
+void x68k_sr_pre(void) { if (s_stepped) rp_take_pending(); }
+
+void x68k_sr_written(void)
+{
+
+    if (s_stepped) { rp_take_pending(); return; }   /* an unmasked replayed interrupt */
+    s_check_now = 1;
+    force_boundary();
+}
 
 void x68k_divide_by_zero(uint32_t next_pc)
 {
@@ -268,7 +295,8 @@ static void fm_update(uint32_t t);
 
 static void z80_run(uint32_t target)
 {
-    if (s_zstate == 1) machine_z80_exact_step(&s_zclk, target);
+    /* Stepped: no clock, and every 68000 read of the Z80 area is replayed. */
+    if (s_zstate == 1 && !s_stepped) machine_z80_exact_step(&s_zclk, target);
     else               s_zclk = target;
 }
 
@@ -389,9 +417,39 @@ static void vdp_ctrl_w(uint16_t data);
  * DMA's start), or at a line start (the frame loop, CPU parked). */
 static void dma_update_at(uint32_t now, int from_cpu);
 static void dma_update(uint32_t now) { dma_update_at(now, 1); }
+static void dma_finished(void)
+{
+    uint16_t end = (uint16_t)(REG(21) + (REG(22) << 8) + REG(19) + (REG(20) << 8));
+    REG(21) = (uint8_t)end;
+    REG(22) = (uint8_t)(end >> 8);
+    REG(19) = REG(20) = 0;
+    if (s_cached_write >= 0) {
+        uint16_t w = (uint16_t)s_cached_write;
+        s_cached_write = -1;
+        vdp_ctrl_w(w);
+    }
+}
+
 static void dma_update_at(uint32_t now, int from_cpu)
 {
     static const uint32_t rate_tab[2][2] = { { 16, 18 }, { 167, 205 } };
+    if (s_stepped) {
+        /* No clock: the whole transfer happens at its start. Status reads are
+         * replayed, so the busy flag the game polls comes from the reference. */
+        uint32_t n = s_dma_length;
+        s_dma_length = 0;
+        if (n) {
+            switch (s_dma_type) {
+            case 0: case 1: dma_68k(n); break;
+            case 2:         dma_fill(n); break;
+            default:        dma_copy(n); break;
+            }
+        }
+        s_status &= (uint16_t)~0x02;
+        dma_finished();
+        (void)now; (void)from_cpu;
+        return;
+    }
     int blank = (s_status & 8) || !(REG(1) & 0x40);
     uint32_t rate = rate_tab[blank][REG(12) & 1] >> (s_dma_type & 1);
     int32_t dma_cycles;
@@ -421,17 +479,7 @@ static void dma_update_at(uint32_t now, int from_cpu)
         case 2:         dma_fill((uint32_t)dma_bytes); break;
         default:        dma_copy((uint32_t)dma_bytes); break;
         }
-        if (!s_dma_length) {
-            uint16_t end = (uint16_t)(REG(21) + (REG(22) << 8) + REG(19) + (REG(20) << 8));
-            REG(21) = (uint8_t)end;
-            REG(22) = (uint8_t)(end >> 8);
-            REG(19) = REG(20) = 0;
-            if (s_cached_write >= 0) {
-                uint16_t w = (uint16_t)s_cached_write;
-                s_cached_write = -1;
-                vdp_ctrl_w(w);
-            }
-        }
+        if (!s_dma_length) dma_finished();
     }
 }
 
@@ -769,11 +817,8 @@ static uint16_t open_bus16(void)
     return (uint16_t)((g_rom[next] << 8) | g_rom[next + 1]);
 }
 
-uint16_t xbus_read16(uint32_t a)
+static uint16_t dev_read16(uint32_t a)
 {
-    a &= 0xFFFFFFu;
-    if (a >= 0xFF0000u) return (uint16_t)((g_ram[a & 0xFFFF] << 8) | g_ram[(a + 1) & 0xFFFF]);
-    if (a < 0x400000u)  return (uint16_t)((g_rom[a] << 8) | g_rom[a + 1]);
     if (vdp_port(a)) {
         switch (a & 0x1C) {
         case 0x00: return vdp_data_r();
@@ -795,11 +840,8 @@ uint16_t xbus_read16(uint32_t a)
     return gbus_read16(&g_machine.bus, a);
 }
 
-uint8_t xbus_read8(uint32_t a)
+static uint8_t dev_read8(uint32_t a)
 {
-    a &= 0xFFFFFFu;
-    if (a >= 0xFF0000u) return g_ram[a & 0xFFFF];
-    if (a < 0x400000u)  return g_rom[a];
     if (a >= 0xA00000u && a < 0xA10000u) {
         if (!s_zaccess) { uint16_t w = open_bus16(); return (a & 1) ? (uint8_t)w : (uint8_t)(w >> 8); }
         if ((a & 0x6000) == 0x4000) return exact_ym_read(g_xstart);
@@ -808,14 +850,427 @@ uint8_t xbus_read8(uint32_t a)
     }
     if (a >= 0xA10000u && a < 0xA10020u) return io_read((a >> 1) & 0x0F);
     if (a == 0xA11100u) { uint8_t b = (uint8_t)(open_bus16() >> 8); return (uint8_t)(s_zstate == 3 ? (b & 0xFE) : (b | 0x01)); }
-    uint16_t w = xbus_read16(a & ~1u);
+    uint16_t w = dev_read16(a & ~1u);
     return (a & 1) ? (uint8_t)w : (uint8_t)(w >> 8);
+}
+
+/* ======================================================================== */
+/* Logical positions: sync points and the hardware/interrupt replay log      */
+/*
+ * Hand-written C has no instruction timing, so it is compared with the timed
+ * run at logical positions instead of master clocks. A position is (interrupt
+ * depth, game-function entries in that context, hardware reads since the last
+ * entry); depth 0 is the main program, and every interrupt opens a context at
+ * depth+1 with its own counters. Entries are XENTRY calls for addresses in
+ * GameSpec.game_functions; hardware reads are 68000 reads of $A00000-$A1FFFF
+ * (Z80 area, I/O, bus control) and $C00000-$C0001F (VDP ports).
+ *
+ * Timed runner with GENESIS_REPLAY_OUT=path writes the replay log:
+ *   header  "X2RP", u32 version 3, u32 sync_pc
+ *   'R' u8 size, u16 run, u32 addr, u16 value       run identical reads in a row
+ *   'I' u8 level, u8 depth, u8 0, u32 reads, u64 entries, u32 since, u32 until
+ *       interrupt taken there, `since` instructions of its context after the position's
+ *       event and `until` before the context's next event
+ *   'S' u8 0,0,0, u32 frame, u64 sync, u64 entries   sync point (depth 0)
+ *   'X' u8 depth,0,0, u32 reads, u64 entries         end (depth-0 position)
+ * all little-endian. The stepped runner (GameSpec.stepped, untimed code) reads
+ * it back with GENESIS_REPLAY_IN: hardware reads return the logged values in
+ * order (the VDP still sees the read: address increment, command latch), and an
+ * interrupt logged at position P is taken at the first event (entry, hardware
+ * read, SR write) that finds the program at P and unmasked, before that event:
+ * exactly where the timed runner, which takes interrupts at instruction
+ * boundaries, could have taken it. Nothing else comes from the reference. */
+
+#define XDEPTH_MAX 8
+typedef struct { uint64_t entries; uint32_t reads; uint64_t ev; } XPos;   /* ev: g_xinsn at the last event */
+/* Timed: interrupt records of a context still waiting for their `until` (instructions of
+   that context between the interrupt and its next event), patched in at that event. */
+#define XPEND_MAX 16
+static struct { long off; uint32_t since; } s_pend[XDEPTH_MAX][XPEND_MAX];
+static int s_npend[XDEPTH_MAX];
+uint64_t g_xinsn;                 /* instructions started (XI), timed runner */
+static uint64_t s_irq_insn0[XDEPTH_MAX];
+static XPos     s_pos[XDEPTH_MAX];
+static uint8_t *s_fnmap;          /* bit per word address: a game function starts here */
+static uint64_t s_sync_no;
+static FILE    *s_rp_out, *s_rp_in;
+static int      s_rp_hw;          /* hardware reads go through hw_read (log or replay) */
+static int      s_rp_done;
+
+static int is_game_function(uint32_t a)
+{
+    if (!s_fnmap) {
+        if (!g_game_spec.game_function_count) return 0;
+        s_fnmap = (uint8_t *)calloc(0x400000u / 16u, 1);
+        for (unsigned i = 0; i < g_game_spec.game_function_count; i++) {
+            uint32_t f = g_game_spec.game_functions[i] & 0x3FFFFEu;
+            s_fnmap[f >> 4] |= (uint8_t)(1u << ((f >> 1) & 7));
+        }
+    }
+    a &= 0x3FFFFEu;
+    return (s_fnmap[a >> 4] >> ((a >> 1) & 7)) & 1;
+}
+
+static int is_hw(uint32_t a)
+{
+    return (a >= 0xA00000u && a < 0xA20000u) || (a >= 0xC00000u && a < 0xC00020u);
+}
+
+/* ---- log writer (timed) ---- */
+static struct { uint32_t addr; uint16_t value; uint8_t size; uint32_t run; } s_rl;
+
+/* The log is built in memory (interrupt records are patched after the fact) and written
+   at exit. */
+static uint8_t *s_wbuf;
+static size_t   s_wlen, s_wcap;
+static void put(const void *p, size_t n)
+{
+    if (s_wlen + n > s_wcap) {
+        s_wcap = s_wcap ? s_wcap * 2 : (size_t)1 << 24;
+        s_wbuf = (uint8_t *)realloc(s_wbuf, s_wcap);
+        if (!s_wbuf) { fprintf(stderr, "[replay] out of memory for the log\n"); exit(2); }
+    }
+    memcpy(s_wbuf + s_wlen, p, n);
+    s_wlen += n;
+}
+static void put8(uint8_t v)   { put(&v, 1); }
+static void put16(uint16_t v) { uint8_t b[2] = { (uint8_t)v, (uint8_t)(v >> 8) }; put(b, 2); }
+static void put32(uint32_t v) { put16((uint16_t)v); put16((uint16_t)(v >> 16)); }
+static void put64(uint64_t v) { put32((uint32_t)v); put32((uint32_t)(v >> 32)); }
+
+static unsigned long long s_wr_no;   /* records written (timed), numbered like the reader's */
+static void rl_flush(void)
+{
+    while (s_rl.run) {
+        uint16_t n = (uint16_t)(s_rl.run > 0xFFFFu ? 0xFFFFu : s_rl.run);
+        put8('R'); put8(s_rl.size); put16(n); put32(s_rl.addr); put16(s_rl.value);
+        s_rl.run -= n;
+        s_wr_no++;
+    }
+}
+
+static void rp_log_read(uint32_t a, uint8_t size, uint16_t v)
+{
+    if (s_rl.run && s_rl.addr == a && s_rl.size == size && s_rl.value == v) { s_rl.run++; return; }
+    rl_flush();
+    s_rl.addr = a; s_rl.size = size; s_rl.value = v; s_rl.run = 1;
+}
+
+static void rp_close_out(void)
+{
+    if (!s_rp_out) return;
+    rl_flush();
+    put8('X'); put8((uint8_t)s_depth); put16(0); put32(s_pos[0].reads); put64(s_pos[0].entries);
+    fwrite(s_wbuf, 1, s_wlen, s_rp_out);
+    fclose(s_rp_out);
+    s_rp_out = NULL;
+}
+
+/* ---- log reader (stepped) ---- */
+typedef struct {
+    uint8_t  type, size, level, depth;
+    uint32_t addr, frame, reads, run, since, until;
+    uint16_t value;
+    uint64_t entries, sync;
+} RpRec;
+static RpRec    s_rec;
+static uint64_t s_rec_no;
+
+static int get(void *p, size_t n) { return fread(p, 1, n, s_rp_in) == n; }
+static uint8_t  get8(void)  { uint8_t b = 0; get(&b, 1); return b; }
+static uint16_t get16(void) { uint8_t b[2] = { 0, 0 }; get(b, 2); return (uint16_t)(b[0] | b[1] << 8); }
+static uint32_t get32(void) { uint32_t lo = get16(); return lo | (uint32_t)get16() << 16; }
+static uint64_t get64(void) { uint64_t lo = get32(); return lo | (uint64_t)get32() << 32; }
+
+/* GENESIS_REPLAY_TRACE=from,to: the stepped runner logs its events and the records it consumes
+   while the record number is in [from, to] (first-divergence aid). */
+static unsigned long long s_rt_from = 1, s_rt_to;
+static void rp_trace(const char *what, uint32_t a)
+{
+    unsigned long long no = s_stepped ? s_rec_no : s_wr_no + 1;
+    if (no < s_rt_from || no > s_rt_to) return;
+    fprintf(stderr, "[rt] rec %llu %s %06X  depth %d entries %llu reads %u SR %04X\n", no,
+            what, (unsigned)a, s_depth, (unsigned long long)s_pos[s_depth].entries, s_pos[s_depth].reads,
+            (unsigned)g_cpu.SR);
+}
+
+static void rp_next(void)
+{
+    memset(&s_rec, 0, sizeof s_rec);
+    int t = fgetc(s_rp_in);
+    s_rec_no++;
+    switch (t) {
+    case 'R': s_rec.type = 'R'; s_rec.size = get8(); s_rec.run = get16(); s_rec.addr = get32();
+              s_rec.value = get16(); break;
+    case 'I': s_rec.type = 'I'; s_rec.level = get8(); s_rec.depth = get8(); (void)get8();
+              s_rec.reads = get32(); s_rec.entries = get64(); s_rec.since = get32();
+              s_rec.until = get32(); break;
+    case 'S': s_rec.type = 'S'; (void)get8(); (void)get16(); s_rec.frame = get32();
+              s_rec.sync = get64(); s_rec.entries = get64(); break;
+    case 'X': s_rec.type = 'X'; s_rec.depth = get8(); (void)get16(); s_rec.reads = get32();
+              s_rec.entries = get64(); break;
+    default:  s_rec.type = 'X'; s_rec.entries = UINT64_MAX; s_rec.reads = UINT32_MAX; break;  /* EOF */
+    }
+}
+
+static uint32_t s_last_entry;          /* last game function entered (diagnostics) */
+static void rp_divergence(const char *what)
+{
+    fprintf(stderr, "[replay] divergence at record %llu (%c): %s; position depth %d entries %llu reads %u, "
+                    "sync %llu, last entry $%06X, SR %04X\n", (unsigned long long)s_rec_no, s_rec.type ? s_rec.type : '?', what, s_depth,
+            (unsigned long long)s_pos[s_depth].entries, s_pos[s_depth].reads, (unsigned long long)s_sync_no,
+            (unsigned)s_last_entry, (unsigned)g_cpu.SR);
+    fflush(stderr);
+    exit(3);
+}
+
+/* The reference ended here: the stepped run stops (the fiber stays parked). */
+static void rp_finish(void)
+{
+    s_rp_done = 1;
+    fprintf(stderr, "[replay] end of the reference after %llu sync points\n", (unsigned long long)s_sync_no);
+    fflush(stderr);
+    for (;;) glue_exact_park();
+}
+
+static int pos_before(uint64_t e, uint32_t r, const XPos *p)
+{
+    return e < p->entries || (e == p->entries && r < p->reads);
+}
+
+/* Take the logged interrupts due at the current position (unmasked). Before an event: all of
+   them. Right after the event that reached the position (after_event): only those the timed
+   run took at the very next instruction boundary (no instruction between: `since` 0). */
+static void rp_take_pending_at(int after_event)
+{
+    while (s_rec.type == 'I' && s_rec.depth == s_depth) {
+        const XPos *p = &s_pos[s_depth];
+        if (pos_before(s_rec.entries, s_rec.reads, p)) rp_divergence("passed a logged interrupt");
+        if (s_rec.entries != p->entries || s_rec.reads != p->reads) return;
+        /* right after the event: the interrupts the timed run took nearer to it than to the
+           next event; the others before the next event (or at an SR write that unmasks them) */
+        if (after_event && s_rec.since > s_rec.until) return;
+        unsigned level = s_rec.level;
+        if (level <= ((g_cpu.SR >> 8) & 7u)) return;   /* masked: an SR write unmasks it */
+        rp_trace(after_event ? "take irq (immediate)" : "take irq", level);
+        rp_next();
+        take_interrupt(g_xpc, level);
+    }
+    if (s_rec.type == 'I' && s_rec.depth > s_depth) rp_divergence("logged interrupt is nested deeper");
+}
+static void rp_take_pending(void) { rp_take_pending_at(0); }
+
+/* ---- events ---- */
+static void pos_irq_enter(unsigned level)
+{
+    if (s_rp_out) {
+        /* instructions this context ran since its last event (the handlers it was interrupted
+           by excluded): 0 = taken at the boundary right after the event */
+        uint64_t since = g_xinsn - s_pos[s_depth].ev;
+        uint32_t since32 = since > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)since;
+        rl_flush();
+        rp_trace("take irq", level);
+        s_wr_no++;
+        put8('I'); put8((uint8_t)level); put8((uint8_t)s_depth); put8(0);
+        put32(s_pos[s_depth].reads); put64(s_pos[s_depth].entries);
+        put32(since32);
+        if (s_npend[s_depth] < XPEND_MAX) {
+            s_pend[s_depth][s_npend[s_depth]].off = (long)s_wlen;
+            s_pend[s_depth][s_npend[s_depth]].since = since32;
+            s_npend[s_depth]++;
+        }
+        put32(0xFFFFFFFFu);   /* until: patched at this context's next event */
+    }
+    if (++s_depth >= XDEPTH_MAX) { fprintf(stderr, "[exact] interrupts nested too deep\n"); exit(4); }
+    s_npend[s_depth] = 0;
+    s_pos[s_depth].entries = 0;
+    s_pos[s_depth].reads = 0;
+    s_pos[s_depth].ev = g_xinsn;
+    s_irq_insn0[s_depth] = g_xinsn;
+}
+
+/* Timed: this context's event: patch `until` into the interrupt records it is waiting for. */
+static void rp_patch_until(void)
+{
+    int d = s_depth;
+    if (!s_rp_out || !s_npend[d]) return;
+    uint64_t total = g_xinsn - s_pos[d].ev;
+    rl_flush();
+    for (int i = 0; i < s_npend[d]; i++) {
+        uint64_t u = total - s_pend[d][i].since;
+        uint32_t u32 = u > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)u;
+        uint8_t *q = s_wbuf + s_pend[d][i].off;
+        q[0] = (uint8_t)u32; q[1] = (uint8_t)(u32 >> 8); q[2] = (uint8_t)(u32 >> 16); q[3] = (uint8_t)(u32 >> 24);
+    }
+
+    s_npend[d] = 0;
+}
+
+static void pos_irq_leave(void)
+{
+    uint64_t handler = g_xinsn - s_irq_insn0[s_depth];
+    s_depth--;
+    s_pos[s_depth].ev += handler;
+}
+
+static void sync_point(void)
+{
+    uint64_t frame = s_frame_no;
+    s_sync_no++;
+    if (s_stepped) {
+        if (s_rec.type != 'S') rp_divergence("sync point the reference did not reach here");
+        if (s_rec.sync != s_sync_no || s_rec.entries != s_pos[0].entries)
+            rp_divergence("sync point at a different position");
+        frame = s_rec.frame;
+        rp_next();
+    } else if (s_rp_out) {
+        rl_flush();
+        s_wr_no++;
+        put8('S'); put8(0); put16(0); put32((uint32_t)s_frame_no); put64(s_sync_no); put64(s_pos[0].entries);
+    }
+    if (g_game_spec.on_sync) g_game_spec.on_sync(s_sync_no, frame);
+    if (s_stepped) glue_exact_park();          /* one runner frame per sync interval */
+}
+
+int x68k_entry(uint32_t addr)
+{
+    if (is_game_function(addr)) {
+        if (s_stepped) {
+            rp_take_pending();
+            if (s_depth == 0 && s_rec.type == 'X' && s_pos[0].entries + 1 > s_rec.entries) rp_finish();
+        }
+        rp_patch_until();
+        s_pos[s_depth].entries++;
+        s_pos[s_depth].reads = 0;
+        s_pos[s_depth].ev = g_xinsn;
+        s_last_entry = addr;
+        if (s_stepped || s_rp_out) rp_trace("entry", addr);
+        if (s_depth == 0 && addr == g_game_spec.sync_pc) sync_point();
+        if (s_stepped) rp_take_pending_at(1);
+    }
+    return g_game_spec.on_entry ? g_game_spec.on_entry(addr) : 0;
+}
+
+static uint16_t hw_read(uint32_t a, uint8_t size)
+{
+    uint16_t v;
+    if (s_stepped) {
+        rp_take_pending();
+        if (s_rec.type == 'X') rp_finish();
+        if (s_rec.type != 'R') {
+            char m[120];
+            snprintf(m, sizeof m, "hardware read $%06X.%u where the reference %s", a, size,
+                     s_rec.type == 'S' ? "reached a sync point" : "took an interrupt");
+            rp_divergence(m);
+        }
+
+        if (s_rec.addr != a || s_rec.size != size) {
+            char m[96];
+            snprintf(m, sizeof m, "read $%06X.%u, reference read $%06X.%u", a, size, s_rec.addr, s_rec.size);
+            rp_divergence(m);
+        }
+        v = s_rec.value;
+        rp_trace("read", a);
+        if (--s_rec.run == 0) rp_next();
+        if (vdp_port(a)) {                      /* the read's effect on the VDP */
+            if ((a & 0x1C) == 0x00) (void)vdp_data_r();
+            else if ((a & 0x1C) == 0x04) (void)vdp_ctrl_r(g_xstart);
+        }
+    } else if (g_xhw_hook && g_xhw_hook(a, size, 0, 0, &v)) {
+        /* supplied by the verification harness: no device access */
+    } else {
+        v = size == 1 ? dev_read8(a) : dev_read16(a);
+        if (g_xhw_hook) g_xhw_hook(a, size, 1, v, NULL);
+        if (s_rp_out) { rp_patch_until(); rp_log_read(a, size, v); rp_trace("read", a); }
+    }
+    s_pos[s_depth].reads++;
+    s_pos[s_depth].ev = g_xinsn;
+    if (s_stepped) rp_take_pending_at(1);
+    return v;
+}
+
+static void positions_init(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    s_stepped = g_game_spec.stepped;
+    const char *out = getenv("GENESIS_REPLAY_OUT"), *in = getenv("GENESIS_REPLAY_IN");
+    if (s_stepped) {
+        if (!in || !*in || !(s_rp_in = fopen(in, "rb"))) {
+            fprintf(stderr, "[replay] stepped build: GENESIS_REPLAY_IN must name a replay log\n");
+            exit(2);
+        }
+        setvbuf(s_rp_in, NULL, _IOFBF, 1 << 20);
+        char magic[4] = { 0 };
+        get(magic, 4);
+        uint32_t ver = get32(), sync_pc = get32();
+        if (memcmp(magic, "X2RP", 4) || ver != 3 || sync_pc != g_game_spec.sync_pc) {
+            fprintf(stderr, "[replay] %s: not a version-3 replay log for sync point $%06X\n", in,
+                    g_game_spec.sync_pc);
+            exit(2);
+        }
+        rp_next();
+        s_rp_hw = 1;
+        const char *rt = getenv("GENESIS_REPLAY_TRACE");
+        if (rt) sscanf(rt, "%llu,%llu", &s_rt_from, &s_rt_to);
+
+    } else if (out && *out) {
+        if (!(s_rp_out = fopen(out, "wb"))) { fprintf(stderr, "[replay] cannot write %s\n", out); exit(2); }
+        setvbuf(s_rp_out, NULL, _IOFBF, 1 << 22);
+        put("X2RP", 4); put32(3); put32(g_game_spec.sync_pc);
+        if (getenv("GENESIS_SHARED_OUT")) { s_shared = (uint8_t *)calloc(0x10000, 1); atexit(shared_dump); }
+        const char *rt = getenv("GENESIS_REPLAY_TRACE");
+        if (rt) sscanf(rt, "%llu,%llu", &s_rt_from, &s_rt_to);
+
+        atexit(rp_close_out);
+        s_rp_hw = 1;
+    }
+}
+
+/* GENESIS_SHARED_OUT=path (timed, diagnostics): which work-RAM bytes interrupt handlers access
+   and the main program reads / writes; written at exit as one line per byte with flags. */
+static uint8_t *s_shared;   /* bit0 handler read, bit1 handler write, bit2 main read, bit3 main write */
+static inline void shared_mark(uint32_t a, int n, int write)
+{
+    uint8_t f = (uint8_t)(s_depth ? (write ? 2 : 1) : (write ? 8 : 4));
+    for (int i = 0; i < n; i++) s_shared[(a + (uint32_t)i) & 0xFFFF] |= f;
+}
+static void shared_dump(void)
+{
+    FILE *f = fopen(getenv("GENESIS_SHARED_OUT"), "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < 0x10000; i++)
+        if ((s_shared[i] & 3) && (s_shared[i] & 12)) fprintf(f, "%06X %X\n", 0xFF0000u + i, s_shared[i]);
+    fclose(f);
+}
+
+uint16_t xbus_read16(uint32_t a)
+{
+    a &= 0xFFFFFFu;
+    if (s_shared && a >= 0xFF0000u) shared_mark(a, 2, 0);
+    if (a >= 0xFF0000u) return (uint16_t)((g_ram[a & 0xFFFF] << 8) | g_ram[(a + 1) & 0xFFFF]);
+    if (a < 0x400000u)  return (uint16_t)((g_rom[a] << 8) | g_rom[a + 1]);
+    if ((s_rp_hw || g_xhw_hook) && is_hw(a)) return hw_read(a, 2);
+    return dev_read16(a);
+}
+
+uint8_t xbus_read8(uint32_t a)
+{
+    a &= 0xFFFFFFu;
+    if (s_shared && a >= 0xFF0000u) shared_mark(a, 1, 0);
+    if (a >= 0xFF0000u) return g_ram[a & 0xFFFF];
+    if (a < 0x400000u)  return g_rom[a];
+    if ((s_rp_hw || g_xhw_hook) && is_hw(a)) return (uint8_t)hw_read(a, 1);
+    return dev_read8(a);
 }
 
 void xbus_write16(uint32_t a, uint16_t v)
 {
     a &= 0xFFFFFFu;
+    if (s_shared && a >= 0xFF0000u) shared_mark(a, 2, 1);
     if (a >= 0xFF0000u) { g_ram[a & 0xFFFF] = (uint8_t)(v >> 8); g_ram[(a + 1) & 0xFFFF] = (uint8_t)v; return; }
+    if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 2, 2, v, NULL)) return;
     if (vdp_port(a)) {
         switch (a & 0x1C) {
         case 0x00: vdp_data_w(v); return;
@@ -834,7 +1289,9 @@ void xbus_write16(uint32_t a, uint16_t v)
 void xbus_write8(uint32_t a, uint8_t v)
 {
     a &= 0xFFFFFFu;
+    if (s_shared && a >= 0xFF0000u) shared_mark(a, 1, 1);
     if (a >= 0xFF0000u) { g_ram[a & 0xFFFF] = v; return; }
+    if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 1, 2, v, NULL)) return;
     if (a >= 0xA00000u && a < 0xA10000u) {
         if (!s_zaccess) return;
         if ((a & 0x6000) == 0x0000 || (a & 0x6000) == 0x2000) {
@@ -993,6 +1450,7 @@ void exact_reset(void)
     g_machine.bus.z80_busreq = 0; g_machine.bus.z80_reset_off = 0;
     memset(g_machine.vdp.reg, 0, sizeof g_machine.vdp.reg);
     g_machine.vdp.code = 0; g_machine.vdp.address = 0;
+    positions_init();
 }
 
 static void hint_tick(int *h_counter)
@@ -1018,6 +1476,12 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     int h_counter = REG(10);
     int zirq = 1;
 
+    if (s_stepped) {                  /* no clock: run to the next sync point */
+        s_frame_no++;
+        if (!s_rp_done) glue_exact_resume();
+        (void)sink; (void)user;
+        return;
+    }
     s_frame_no++;
     trace_frame_begin();
     { extern void machine_z80_trace_frame(unsigned long long); machine_z80_trace_frame(s_frame_no); }

@@ -47,6 +47,7 @@ set(GENESIS_RUNNER_CORE_SOURCES
     main.c
     sim_step.c
     exact_sched.c
+    ram_views.c
     rb_state.c
     rb_probe.c
     local_states.c

@@ -13,7 +13,7 @@
 
 /* Recompiled 68K memory. */
 extern uint8_t g_rom[0x400000];
-extern uint8_t g_ram[0x010000];
+extern uint8_t *g_ram;
 
 /* Audio write stamps (master cycles since wall-frame start; see
  * genesis_machine.c "Audio write stamping"). 68K-origin writes use the

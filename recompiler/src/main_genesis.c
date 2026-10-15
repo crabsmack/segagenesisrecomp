@@ -91,9 +91,15 @@ int main(int argc, char *argv[]) {
     const char *output_dir = "generated";
     bool reverse_debug = false;
     bool fail_on_unsupported = false;
+    bool untimed = false;
+    const char *prefix_override = NULL;
+    const char *skip_path = NULL;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--game") == 0 && i+1 < argc) game_path = argv[++i];
+        else if (strcmp(argv[i], "--untimed") == 0) untimed = true;
+        else if (strcmp(argv[i], "--skip") == 0 && i+1 < argc) skip_path = argv[++i];
+        else if (strcmp(argv[i], "--prefix") == 0 && i+1 < argc) prefix_override = argv[++i];
         else if (strcmp(argv[i], "--output-dir") == 0 && i+1 < argc)
             output_dir = argv[++i];
         else if (strcmp(argv[i], "--reverse-debug") == 0) reverse_debug = true;
@@ -135,6 +141,28 @@ int main(int argc, char *argv[]) {
     } else {
         game_config_init_empty(&cfg);
         printf("[GenesisRecomp] No --game config; using empty dispatch tables\n");
+    }
+
+    /* One config, two code sets: --untimed (exact-mode shape, no timing) and
+     * --prefix (its own file/symbol prefix) for a second runner. */
+    if (untimed) cfg.untimed = true;
+    if (prefix_override)
+        snprintf(cfg.output_prefix, sizeof(cfg.output_prefix), "%s", prefix_override);
+    if (skip_path) {
+        FILE *sf = fopen(skip_path, "r");
+        if (!sf) {
+            fprintf(stderr, "[GenesisRecomp] cannot read --skip %s\n", skip_path);
+            return 1;
+        }
+        char line[64];
+        while (fgets(line, sizeof line, sf)) {
+            unsigned long a;
+            if (sscanf(line, "%lx", &a) != 1) continue;
+            cfg.skip_addrs = (uint32_t *)realloc(cfg.skip_addrs, (size_t)(cfg.skip_count + 1) * sizeof(uint32_t));
+            cfg.skip_addrs[cfg.skip_count++] = (uint32_t)a;
+        }
+        fclose(sf);
+        printf("[GenesisRecomp] --skip: %d functions supplied by other code\n", cfg.skip_count);
     }
 
     /* Determine output prefix */

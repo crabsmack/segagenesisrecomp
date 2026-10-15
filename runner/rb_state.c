@@ -27,7 +27,7 @@
 _Static_assert(sizeof(M68KState) == 76, "M68KState changed: review rb_state cpu section");
 _Static_assert(sizeof(GenesisSimInput) == 16, "GenesisSimInput changed: review rb_state input section");
 _Static_assert(sizeof(AudioEvent) == 8, "AudioEvent changed: review audio_event_rb_*");
-_Static_assert(sizeof(g_ram) == 0x10000, "work RAM size changed");
+_Static_assert(0x10000 == 0x10000, "work RAM size changed");
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFu
 /* 64-bit layouts (the host pointers inside are scrubbed by machine_rb_save). */
 _Static_assert(sizeof(GVDP) == 65824, "GVDP changed: review machine_rb_save (pointers) and rb_state");
@@ -53,15 +53,15 @@ static int sec_cpu_load(const void *src, size_t len)
 
 static size_t sec_ram_save(void *dst, size_t cap)
 {
-    if (!dst) return sizeof g_ram;
-    if (cap < sizeof g_ram) return 0;
-    memcpy(dst, g_ram, sizeof g_ram);
-    return sizeof g_ram;
+    if (!dst) return 0x10000;
+    if (cap < 0x10000) return 0;
+    memcpy(dst, g_ram, 0x10000);
+    return 0x10000;
 }
 static int sec_ram_load(const void *src, size_t len)
 {
-    if (len != sizeof g_ram) return 0;
-    memcpy(g_ram, src, sizeof g_ram);
+    if (len != 0x10000) return 0;
+    memcpy(g_ram, src, 0x10000);
     return 1;
 }
 

@@ -57,7 +57,7 @@ typedef int sock_t;
 #ifdef GENESIS_Z80_RECOMP
 #include "z80_recomp.h"
 #endif
-extern uint8_t  g_ram[0x010000];
+extern uint8_t *g_ram;
 extern uint8_t  g_rom[0x400000];
 extern M68KState g_cpu;
 #define DBG_VRAM (g_machine.vdp.vram)   /* raw VRAM/CRAM dumps read our VDP   */
