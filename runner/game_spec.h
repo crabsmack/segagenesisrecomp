@@ -198,6 +198,27 @@ typedef struct GameSpec {
      * without configured sites incur no calls or behavior changes. */
     int       (*instruction_hook)(uint32_t pc);
 
+    /* ---- Logical positions (exact mode; runner/exact_sched.c) ----
+     * A position is (interrupt depth, game-function entries in that context,
+     * hardware reads since the last entry). game_functions (sorted) are the
+     * addresses XENTRY counts: jump-table stubs and other glue are not game
+     * functions. A main-context entry to sync_pc is a sync point: on_sync(sync,
+     * frame) runs there (sync counts from 1; frame is the timed run's hardware
+     * frame, or the logged one in a stepped run). GENESIS_REPLAY_OUT=path makes
+     * the timed runner log every hardware read, interrupt and sync point with
+     * its position. stepped = 1: this build's generated code is untimed
+     * (GenesisRecomp --untimed), and the runner replays GENESIS_REPLAY_IN by
+     * position instead of scheduling by clock. */
+    const uint32_t *game_functions;
+    unsigned        game_function_count;
+    uint32_t        sync_pc;
+    void          (*on_sync)(uint64_t sync, uint64_t frame);
+    int             stepped;
+    /* Every XENTRY (any function, after the position bookkeeping). Return nonzero
+     * when the hook ran the function's body itself (a verification harness): the
+     * generated wrapper then returns at once. NULL = 0. */
+    int           (*on_entry)(uint32_t addr);
+
     /* Opt-in main-program CPU headroom, queried at each scheduler slice.
      * NULL / <=1 = exact native timing. IRQ, DMA, raster and sound clocks
      * stay native. A game must retain its real VBlank wait as the tick gate.

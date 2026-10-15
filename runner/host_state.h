@@ -2,7 +2,7 @@
  * existing games continue to use their unchanged GROWNS2 path. Raw machine
  * payloads are private to this exact source/compiler/architecture fingerprint. */
 enum { HOST_STATE_SECTIONS=6, HOST_STATE_LIMIT=32*1024*1024 };
-extern uint8_t g_ram[65536];
+extern uint8_t *g_ram;
 extern uint8_t g_rom[0x400000];
 static Uint32 host_state_notice_until;
 static void host_state_notice(const char *message)

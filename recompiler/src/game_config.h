@@ -275,6 +275,19 @@ typedef struct {
      * Replaces the per-instruction accounting and the WaitForVBlank/poll-loop
      * yield heuristics. Default false. */
     bool           exact_timing;
+    /* With exact_timing: keep the exact-mode code shape (label entries, hardware
+     * call/return, XSR) but emit no timing (no XI/XC). For a runner that
+     * schedules by logical position (runner/exact_sched.c stepped mode).
+     * game.toml `untimed`, or GenesisRecomp --untimed. Default false. */
+    bool           untimed;
+    /* XENTRY(addr) when a function is entered at its own start (a C-level
+     * call of func_ADDR, never a branch inside its body): the runtime counts
+     * game-function entries there. game.toml `entry_hooks`. Default false. */
+    bool           entry_hooks;
+    /* GenesisRecomp --skip FILE: functions (hex addresses, one per line) supplied
+     * by other code; declared in the header but not emitted. */
+    uint32_t      *skip_addrs;
+    int            skip_count;
     /* Widescreen (16:9) injection sites, from [[widescreen_site]] in game.toml.
      * Consumed at codegen time (not emitted to the runtime layout). Empty =>
      * no widescreen injection for this game. */

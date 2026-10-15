@@ -1100,7 +1100,7 @@ int runner_save_state_file(const char *path)
         return 0;
     }
 
-    extern uint8_t g_ram[0x010000];
+    extern uint8_t *g_ram;
     int ok = fwrite(OWN_SAVE_MAGIC, 1, sizeof(OWN_SAVE_MAGIC), sf) == sizeof(OWN_SAVE_MAGIC);
     glue_save_state(sf);
     ok = ok && fwrite(g_ram, 1, 0x10000, sf) == 0x10000;
@@ -1146,7 +1146,7 @@ int runner_load_state_file(const char *path)
         return 0;
     }
 
-    extern uint8_t g_ram[0x010000];
+    extern uint8_t *g_ram;
     int ok = 1;
     glue_load_state(sf);
     ok = ok && fread(g_ram, 1, 0x10000, sf) == 0x10000;
@@ -1333,7 +1333,7 @@ static void runner_sram_autosave_tick(uint32_t frame_num)
 static uint8_t runner_ram_byte(uint32_t addr)
 {
     uint16_t off = (uint16_t)(addr & 0xFFFFu);
-    extern uint8_t g_ram[0x010000];   /* own bus's authoritative WRAM */
+    extern uint8_t *g_ram;   /* own bus's authoritative WRAM */
     return g_ram[off];
 }
 
@@ -1417,7 +1417,7 @@ static void check_ramdump(void)
     /* Align by game state: dump when in a gameplay mode (per-game
      * level_modes from g_game_layout) with the player object active
      * (obj_id byte = $01 = Sonic) and 50 frames into stable state. */
-    extern uint8_t g_ram[0x10000];
+    extern uint8_t *g_ram;
     #define EMU_BYTE_D(a) (g_ram[(a) & 0xFFFF])
     uint8_t mode = EMU_BYTE_D(g_game_layout.game_mode_addr);
     uint8_t obj0 = EMU_BYTE_D(g_game_layout.player_object_addr);
@@ -1456,7 +1456,7 @@ static void write_framelog(uint32_t frame)
      * in our byte array (g_ram). Reading the wrong one yields a stale/blank
      * log — which is why the own-backend framelog must source g_ram so the
      * two logs are directly diffable (clean-room A/B against the oracle). */
-    extern uint8_t g_ram[0x010000];
+    extern uint8_t *g_ram;
     #define EMU_BYTE(addr) ((uint8_t)g_ram[(addr) & 0xFFFF])
     #define EMU_WORD(addr) ((uint16_t)((g_ram[(addr) & 0xFFFF] << 8) | \
                                         g_ram[((addr) + 1) & 0xFFFF]))
@@ -2077,8 +2077,11 @@ static void local_states_modal(SDL_Renderer *renderer, SDL_Texture *game,
     audio_set_playback_enabled(!turbo);
 }
 
+void genesis_ram_init(void);   /* ram_views.c */
+
 int main(int argc, char *argv[])
 {
+    genesis_ram_init();   /* g_ram is a mapping (ram_views.c): before anything touches it */
     init_exe_dir(argv[0]);
     input_map_init_defaults();   /* today's mapping; app_config_load may override */
 #if GENESIS_HAS_RECOMP_NET

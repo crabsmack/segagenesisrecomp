@@ -22,7 +22,9 @@ typedef struct M68KState {
 
 extern M68KState g_cpu;
 extern uint8_t   g_rom[0x400000];   /* 4MB ROM map */
-extern uint8_t   g_ram[0x010000];   /* 64KB main RAM ($FF0000-$FFFFFF) */
+extern uint8_t  *g_ram;             /* 64KB main RAM ($FF0000-$FFFFFF), as $00FFxxxx */
+extern uint8_t  *g_ram_ffff;        /* the same RAM mapped again, as $FFFFxxxx (ram_views.c) */
+void genesis_ram_init(void);        /* maps both views; first thing main() does */
 
 /* Resolve the index value encoded by a 68000 brief extension word.
  * Bit 15 selects An/Dn and bit 11 selects the full long register or the
@@ -253,15 +255,39 @@ void cosim_checkpoint(void);        /* hash + park; advances g_cosim_next_cp    
  * data-dependent cost; XSR requests an interrupt check after an SR write. */
 extern uint32_t g_xclk, g_xstart, g_xend, g_xpc;
 extern uint32_t g_xrts;    /* where the last RTS returned (68000 stack), exact mode */
+extern uint32_t g_xa7min;  /* lowest A7 at any instruction boundary (sync CRC dead stack) */
+extern uint64_t g_xinsn;   /* instructions started (logical positions: interrupt since) */
 extern int      g_xtrace;
 void x68k_slice(uint32_t pc);
 void x68k_sr_written(void);
 void x68k_trace(uint32_t pc);
 void x68k_divide_by_zero(uint32_t next_pc);
 #define XI(pc, c) do { if (g_xclk >= g_xend) x68k_slice(pc); g_xpc = (pc); \
-    g_xstart = g_xclk; if (g_xtrace) x68k_trace(pc); g_xclk += (c); } while (0)
+    g_xstart = g_xclk; if (g_xtrace) x68k_trace(pc); g_xclk += (c); g_xinsn++; \
+    if (g_cpu.A[7] < g_xa7min) g_xa7min = g_cpu.A[7]; } while (0)
+/* game.toml entry_hooks: a game function entered at its own start (a call of
+ * func_ADDR). Counts logical positions (sync points, replay; exact_sched.c).
+ * Nonzero = the body already ran (a verification harness ran it): return. */
+int x68k_entry(uint32_t addr);
+#define XENTRY(addr) x68k_entry(addr)
+/* Verification hooks (exact_sched.c; a shadow-test harness sets them):
+ * g_xhw_hook sees every 68000 hardware access ($A00000-$A1FFFF, $C00000-$C0001F).
+ *   kind 0 = read about to happen: return 1 with *v set to supply the value
+ *            (no device access), 0 to read the device;
+ *   kind 1 = read done (the device returned v);
+ *   kind 2 = write: return 1 to swallow it (no device access).
+ * g_xinsn_hook is called with every instruction's pc while set (via g_xtrace).
+ * g_xirq_taken counts interrupts taken. */
+extern int (*g_xhw_hook)(uint32_t addr, int size, int kind, uint16_t v, uint16_t *out);
+extern void (*g_xinsn_hook)(uint32_t pc);
+extern uint64_t g_xirq_taken;
 #define XC(c) (g_xclk += (uint32_t)(int32_t)(c))
 #define XSR() x68k_sr_written()
+/* Untimed code (stepped runner): before an instruction writes SR, so a logged interrupt due
+ * now is taken while the old mask still allows it. */
+void x68k_sr_pre(void);
+#define XSRP() x68k_sr_pre()
+
 /* Operand-dependent MUL/DIV time in master clocks (the standard 68000 timing
  * algorithms: MULU 38+2n for n set bits, MULS 38+2n for n 01/10 pairs, DIVU
  * and DIVS per the shift-subtract microcode). */

@@ -26,7 +26,7 @@
 /* Read $FFFExxxx as a longword from the 68K work-RAM mirror.
  * Used to capture Vint_runcount (the cross-binary state-sync key) in
  * every Tier-1 store ring entry. */
-extern uint8_t g_ram[0x10000];
+extern uint8_t *g_ram;
 static inline uint32_t rdb_read_wram32(uint16_t off)
 {
     return ((uint32_t)g_ram[off] << 24) | ((uint32_t)g_ram[(uint16_t)(off + 1)] << 16) |

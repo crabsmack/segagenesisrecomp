@@ -2,7 +2,9 @@
 #
 # genesisrecomp_add_generated_sources(
 #     <out-var> <prefix> <game-dir> <rom-name>
-#     [REVERSE_DEBUG <bool>])
+#     [REVERSE_DEBUG <bool>]
+#     [EXTRA_ARGS <recompiler args>...]    # e.g. --untimed --prefix NAME --skip FILE
+#     [EXTRA_DEPENDS <files>...])          # inputs those args name (regenerate on change)
 #
 # The ROM is intentionally a build dependency.  This prevents a runner from
 # silently compiling C generated from some older or different ROM image.
@@ -24,7 +26,7 @@ endif()
 
 function(genesisrecomp_add_generated_sources OUT_VAR PREFIX GAME_DIR ROM_NAME)
     set(one_value_args REVERSE_DEBUG)
-    cmake_parse_arguments(GRG "" "${one_value_args}" "" ${ARGN})
+    cmake_parse_arguments(GRG "" "${one_value_args}" "EXTRA_ARGS;EXTRA_DEPENDS" ${ARGN})
 
     # New consumers own their game sources/configuration and pass an absolute
     # directory. Preserve engine-relative paths for unmigrated consumers.
@@ -99,7 +101,7 @@ function(genesisrecomp_add_generated_sources OUT_VAR PREFIX GAME_DIR ROM_NAME)
     endif()
 
     set(_recompiler_args "${ROM_NAME}" --game game.toml
-        --output-dir "${_stage}")
+        --output-dir "${_stage}" ${GRG_EXTRA_ARGS})
     if(GRG_REVERSE_DEBUG)
         list(APPEND _recompiler_args --reverse-debug)
         set(_reverse_value 1)
@@ -115,7 +117,7 @@ function(genesisrecomp_add_generated_sources OUT_VAR PREFIX GAME_DIR ROM_NAME)
     set(_options_file
         "${CMAKE_CURRENT_BINARY_DIR}/${PREFIX}_generation_options.txt")
     file(GENERATE OUTPUT "${_options_file}"
-         CONTENT "pipeline=2\nprefix=${PREFIX}\ngame=${_game}\nrom=${_rom}\nreverse_debug=${_reverse_value}\nrom_present=${_rom_present}\ninput=${_input_paths}\n")
+         CONTENT "pipeline=2\nprefix=${PREFIX}\nextra_args=${GRG_EXTRA_ARGS}\ngame=${_game}\nrom=${_rom}\nreverse_debug=${_reverse_value}\nrom_present=${_rom_present}\ninput=${_input_paths}\n")
 
     add_custom_command(
         OUTPUT "${_stamp}"
@@ -146,6 +148,7 @@ function(genesisrecomp_add_generated_sources OUT_VAR PREFIX GAME_DIR ROM_NAME)
             "${_game}/game.toml"
             "${_options_file}"
             ${_config_inputs}
+            ${GRG_EXTRA_DEPENDS}
         WORKING_DIRECTORY "${_game}"
         COMMENT "Regenerating ${PREFIX} native C from ${ROM_NAME}"
         VERBATIM

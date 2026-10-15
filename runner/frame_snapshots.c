@@ -24,7 +24,7 @@
  * FM_State/PSG_State, so those stay zeroed here — the FM/PSG register WRITE
  * STREAM (chip_ring) is the cross-backend audio comparable instead. */
 #include "video/genesis_machine.h"
-extern uint8_t g_ram[0x10000];
+extern uint8_t *g_ram;
 
 /* ---------------------------------------------------------------- 68K
  *

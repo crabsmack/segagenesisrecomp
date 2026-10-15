@@ -177,7 +177,7 @@ static void format_addr(char *buf, size_t bufsize, uint32_t addr) {
 
 /* Read a 32-bit big-endian longword from g_ram at offset `off` (0..0xFFFC).
  * Used by the stack walk — A7 is in 68K-RAM ($FFxxxx mirror). Bounds-checked. */
-extern uint8_t g_ram[0x10000];
+extern uint8_t *g_ram;
 static uint32_t ram_read32_be(uint32_t off) {
     if (off + 3 >= 0x10000) return 0;
     return  ((uint32_t)g_ram[off]     << 24) |
