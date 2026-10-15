@@ -179,7 +179,7 @@ static void cram_write(GVDP *v, uint16_t addr, uint16_t value)
 static void vsram_write(GVDP *v, uint16_t addr, uint16_t value)
 {
     unsigned idx = (addr >> 1);
-    if (idx < GVDP_VSRAM_ENTRIES) v->vsram[idx] = value & 0x03FF;
+    if (idx < GVDP_VSRAM_ENTRIES) v->vsram[idx] = value & 0x07FF;  /* 11-bit cells */
 }
 
 /* ---- DMA ------------------------------------------------------------------ */

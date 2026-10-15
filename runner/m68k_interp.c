@@ -27,6 +27,7 @@
 uint32_t g_m68ki_bad_pc = 0;
 uint16_t g_m68ki_bad_op = 0;
 uint64_t g_m68ki_insn_count = 0;
+uint64_t g_m68ki_insn_total = 0;   /* every instruction any capsule retired, whole session */
 
 /* Coverage discovery (see header): distinct call/jump targets this run. */
 uint32_t g_m68ki_discover[M68KI_MAX_DISCOVER];
@@ -1333,7 +1334,7 @@ M68kiStatus m68k_interp_run(uint32_t entry_pc, uint32_t stop_pc) {
     while (g_cpu.PC != (stop_pc & 0xFFFFFFu)) {
         M68kiStatus st = m68k_interp_step();
         if (st != M68KI_OK) return st;
-        if (++g_m68ki_insn_count > M68KI_INSN_GUARD) {
+        if (++g_m68ki_insn_total, ++g_m68ki_insn_count > M68KI_INSN_GUARD) {
             g_m68ki_bad_pc = g_cpu.PC; return M68KI_HALT_GUARD;
         }
     }
@@ -1426,7 +1427,7 @@ M68kiStatus m68k_interp_run_framed(uint32_t entry_pc, uint32_t *out_exit_pc) {
         else if (ins.mnemonic == MN_RTS || ins.mnemonic == MN_RTR)
             depth--;
 
-        if (++g_m68ki_insn_count > M68KI_INSN_GUARD) {
+        if (++g_m68ki_insn_total, ++g_m68ki_insn_count > M68KI_INSN_GUARD) {
             g_m68ki_bad_pc = g_cpu.PC; return M68KI_HALT_GUARD;
         }
     }
@@ -1489,7 +1490,7 @@ M68kiStatus m68k_interp_run_handler(uint32_t entry_pc) {
         else if (ins.mnemonic == MN_RTS || ins.mnemonic == MN_RTR)
             depth--;
 
-        if (++g_m68ki_insn_count > M68KI_INSN_GUARD) {
+        if (++g_m68ki_insn_total, ++g_m68ki_insn_count > M68KI_INSN_GUARD) {
             g_m68ki_bad_pc = g_cpu.PC; return M68KI_HALT_GUARD;
         }
     }
@@ -1582,7 +1583,7 @@ M68kiStatus m68k_interp_run_ram_handler(uint32_t entry_pc, uint32_t *out_exit_pc
         else if (ins.mnemonic == MN_RTS || ins.mnemonic == MN_RTR)
             depth--;
 
-        if (++g_m68ki_insn_count > M68KI_INSN_GUARD) {
+        if (++g_m68ki_insn_total, ++g_m68ki_insn_count > M68KI_INSN_GUARD) {
             g_m68ki_bad_pc = g_cpu.PC; return M68KI_HALT_GUARD;
         }
     }

@@ -3,6 +3,7 @@
 
 #include <string.h>
 
+#include "game_spec.h"
 #include "glue.h"
 #include "audio/mixer.h"
 #include "video/genesis_bus.h"
@@ -74,5 +75,8 @@ int genesis_sim_step(const GenesisSimInput *in, const GenesisSimAudio *audio,
     glue_service_vblank();
     glue_end_of_wall_frame();
     s_ticks++;
+    /* After the whole tick (every replayed tick too): per-game end-of-frame
+     * observation, e.g. state CRCs compared against a reference emulator. */
+    if (g_game_spec.on_frame_post) g_game_spec.on_frame_post(s_ticks);
     return 1;
 }

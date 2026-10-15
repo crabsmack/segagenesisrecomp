@@ -94,6 +94,7 @@ long m68k_interp_cov_dump(FILE *f);     /* ascending hex addrs, one per line; -1
 /* Per-run diagnostics (the manifest/floor layers read these). */
 extern uint32_t g_m68ki_bad_pc;      /* PC of the offending instruction (UNIMPL) */
 extern uint16_t g_m68ki_bad_op;      /* opcode word of the offending instruction */
+extern uint64_t g_m68ki_insn_total;  /* cumulative over every run, never reset  */
 extern uint64_t g_m68ki_insn_count;  /* instructions retired by the last run     */
 
 /* Coverage discovery: the distinct JSR/BSR/JMP targets traversed during the
