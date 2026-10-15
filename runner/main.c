@@ -782,7 +782,7 @@ static cc_bool input_requested_cb(void *user_data,
      * ADD buttons, never mask a live press. Timeline scripts address both
      * native ports; enhanced actors can read the independent P3/P4 masks. */
     if (input_script_active()) {
-        uint8_t mask = input_script_player_mask(player_id);
+        uint16_t mask = input_script_player_mask(player_id);
         switch (button_id) {
             case GB_UP:    if (mask & 0x01) return cc_true; break;
             case GB_DOWN:  if (mask & 0x02) return cc_true; break;
@@ -792,6 +792,10 @@ static cc_bool input_requested_cb(void *user_data,
             case GB_C:     if (mask & 0x20) return cc_true; break;
             case GB_A:     if (mask & 0x40) return cc_true; break;
             case GB_START: if (mask & 0x80) return cc_true; break;
+            case GB_X:     if (mask & 0x100) return cc_true; break;
+            case GB_Y:     if (mask & 0x200) return cc_true; break;
+            case GB_Z:     if (mask & 0x400) return cc_true; break;
+            case GB_MODE:  if (mask & 0x800) return cc_true; break;
             default: break;
         }
     }
@@ -917,6 +921,9 @@ static void collect_sim_input(GenesisSimInput *in)
             pad_mask |= input_current_mask(port) &
                         (GPAD_X | GPAD_Y | GPAD_Z | GPAD_MODE);
 #endif
+        if (g_input_map.p[port].pad_type == PAD_6BUTTON)   /* scripted 6-button extras */
+            pad_mask |= input_script_player_mask(port) &
+                        (GPAD_X | GPAD_Y | GPAD_Z | GPAD_MODE);
         in->pad[port] = pad_mask;
     }
     for (int p = 2; p < GENESIS_SIM_MAX_PLAYERS; p++)

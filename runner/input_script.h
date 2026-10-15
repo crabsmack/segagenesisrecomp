@@ -11,6 +11,8 @@
  *   HOLD <BUTTON>        start holding the button (until RELEASE or EXIT)
  *   RELEASE [BUTTON]     release one button; no arg releases this player's buttons
  *   PRESS <BUTTON> N     hold for N frames then auto-release
+ *   PADS <p1> [<p2> ..]  set players 1..n's whole held masks (hex, bits below);
+ *                        with WAIT, a recorded per-frame input stream
  *   ASSERT_RAM8 <addr> <value>    fail-fast if RAM byte != value
  *   WAIT_RAM8   <addr> <value>    block until RAM byte == value
  *   ASSERT_RAM16 <addr> <value>   ditto, 16-bit big-endian
@@ -25,12 +27,13 @@
  *   DUMP_VRAM   <path>   dump the VDP's raw 64KB VRAM
  *   EXIT [code]          exit cleanly with optional status code
  *
- * BUTTON names: UP DOWN LEFT RIGHT A B C START
+ * BUTTON names: UP DOWN LEFT RIGHT A B C START, 6-button X Y Z MODE
  *
  * Loaded once at startup via input_script_load(). Each wall frame
  * the runner calls input_script_tick(frame). Held-button state is
- * exposed as an 8-bit mask matching the Genesis layout
- * (Up=bit0, Down=1, Left=2, Right=3, B=4, C=5, A=6, Start=7) for
+ * exposed as a 16-bit mask matching the GPAD_* layout
+ * (Up=bit0, Down=1, Left=2, Right=3, B=4, C=5, A=6, Start=7, X=8, Y=9,
+ * Z=10, Mode=11) for
  * the input callback to OR into the joypad read.
  */
 #pragma once
@@ -66,14 +69,14 @@ void input_script_tick(uint64_t frame,
                        input_script_write16_fn w16,
                        input_script_write32_fn w32);
 
-/* Currently-held buttons as an 8-bit mask:
- *   bit 0 UP    bit 4 B
- *   bit 1 DOWN  bit 5 C
- *   bit 2 LEFT  bit 6 A
- *   bit 3 RIGHT bit 7 START
+/* Currently-held buttons as a 16-bit GPAD_* mask:
+ *   bit 0 UP    bit 4 B      bit 8  X
+ *   bit 1 DOWN  bit 5 C      bit 9  Y
+ *   bit 2 LEFT  bit 6 A      bit 10 Z
+ *   bit 3 RIGHT bit 7 START  bit 11 MODE
  */
-uint8_t input_script_held_mask(void);
-uint8_t input_script_player_mask(int player);
+uint16_t input_script_held_mask(void);
+uint16_t input_script_player_mask(int player);
 bool input_script_player_used(int player);
 
 /* True iff the script ran an EXIT directive. The caller should
