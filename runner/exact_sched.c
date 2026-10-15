@@ -127,6 +127,7 @@ static void trace_frame_begin(void)
             }
         }
     }
+    if (s_trace_f) fflush(s_trace_f);   /* exit paths may skip stdio teardown */
     g_xtrace = s_trace_f && s_frame_no >= s_trace_from && s_frame_no <= s_trace_to;
     if (s_trace_f && s_frame_no > s_trace_to) { fclose(s_trace_f); s_trace_f = NULL; g_xtrace = 0; }
 }
@@ -245,6 +246,9 @@ static void m68k_run(uint32_t target)
 /* ======================================================================== */
 /* Z80                                                                       */
 
+static void fm_reset_chip(uint32_t t);
+static void fm_update(uint32_t t);
+
 static void z80_run(uint32_t target)
 {
     if (s_zstate == 1) machine_z80_exact_step(&s_zclk, target);
@@ -266,12 +270,13 @@ static void z80_busreq_w(int req, uint32_t now)
 static void z80_reset_w(int release, uint32_t now)
 {
     if (release) {
-        if (s_zstate == 0) { s_zclk = now; machine_z80_exact_reset(); }
-        else if (s_zstate == 2) { s_zaccess = 1; machine_z80_exact_reset(); }
+        if (s_zstate == 0) { s_zclk = now; machine_z80_exact_reset(); fm_reset_chip(now); }
+        else if (s_zstate == 2) { s_zaccess = 1; machine_z80_exact_reset(); fm_reset_chip(now); }
         s_zstate |= 1;
     } else {
         if (s_zstate == 1) z80_run(now);
         else if (s_zstate == 3) s_zaccess = 0;
+        fm_reset_chip(now);
         s_zstate &= 2;
     }
     g_machine.bus.z80_reset_off = (uint8_t)(s_zstate & 1);
@@ -363,8 +368,11 @@ static void dma_fill(uint32_t bytes)
 static void vdp_ctrl_w(uint16_t data);
 
 /* Advance the current DMA to the end of this line (or of vblank). `now` is
- * the master clock it is serviced at. */
-static void dma_update(uint32_t now)
+ * the master clock it is serviced at: during the 68000's port write (the
+ * DMA's start), or at a line start (the frame loop, CPU parked). */
+static void dma_update_at(uint32_t now, int from_cpu);
+static void dma_update(uint32_t now) { dma_update_at(now, 1); }
+static void dma_update_at(uint32_t now, int from_cpu)
 {
     static const uint32_t rate_tab[2][2] = { { 16, 18 }, { 167, 205 } };
     int blank = (s_status & 8) || !(REG(1) & 0x40);
@@ -378,9 +386,13 @@ static void dma_update(uint32_t now)
         dma_cycles = (int32_t)((dma_bytes * MPL) / rate);
     }
     if (s_dma_type < 2) {
-        /* The 68000 is frozen during a 68K-bus DMA. */
+        /* The 68000 is frozen during a 68K-bus DMA: its clock is SET to the
+         * transfer's end. At the start the triggering instruction's own cost
+         * still follows; a continuation at a line start replaces the clock
+         * outright, as the reference does (that cost is not charged again). */
         uint32_t t = now + (uint32_t)dma_cycles;
-        if (t > g_xstart) { g_xclk += t - g_xstart; g_xstart = t; }
+        if (from_cpu) { g_xclk = t + (g_xclk - g_xstart); g_xstart = t; }
+        else          { g_xclk = t; }
     } else {
         s_status |= 0x02;
         s_dma_end = now + (uint32_t)dma_cycles;
@@ -728,7 +740,7 @@ uint16_t xbus_read16(uint32_t a)
     if (a >= 0xA00000u && a < 0xA10000u) {
         if (!s_zaccess) return open_bus16();                 /* Z80 owns its bus */
         uint8_t b;
-        if ((a & 0x6000) == 0x4000) b = g_machine.bus.ym_status;
+        if ((a & 0x6000) == 0x4000) b = exact_ym_read(g_xstart);
         else if ((a & 0x6000) == 0x6000) b = 0xFF;
         else b = g_machine.bus.z80_ram[a & 0x1FFF];
         return (uint16_t)(b << 8 | b);
@@ -745,7 +757,7 @@ uint8_t xbus_read8(uint32_t a)
     if (a < 0x400000u)  return g_rom[a];
     if (a >= 0xA00000u && a < 0xA10000u) {
         if (!s_zaccess) { uint16_t w = open_bus16(); return (a & 1) ? (uint8_t)w : (uint8_t)(w >> 8); }
-        if ((a & 0x6000) == 0x4000) return g_machine.bus.ym_status;
+        if ((a & 0x6000) == 0x4000) return exact_ym_read(g_xstart);
         if ((a & 0x6000) == 0x6000) return 0xFF;
         return g_machine.bus.z80_ram[a & 0x1FFF];
     }
@@ -785,7 +797,8 @@ void xbus_write8(uint32_t a, uint8_t v)
             g_xstart += 8; g_xclk += 8;                       /* Z80 RAM access latency */
             return;
         }
-        gbus_write8(&g_machine.bus, a, v);                     /* YM2612 / bank */
+        if ((a & 0x6000) == 0x4000) exact_ym_write(g_xstart, a & 3, v);
+        gbus_write8(&g_machine.bus, a, v);                     /* YM2612 audio / bank */
         return;
     }
     if (a >= 0xA10000u && a < 0xA10020u) { if (a & 1) io_write((a >> 1) & 0x0F, v); return; }
@@ -797,6 +810,84 @@ void xbus_write8(uint32_t a, uint8_t v)
         return;
     }
     gbus_write8(&g_machine.bus, a, v);
+}
+
+/* ======================================================================== */
+/* YM2612 timers and status                                                  */
+/* The chip runs in samples of 144 68000 cycles (1008 master clocks) on a fixed
+ * grid; a status read or data-port write first catches it up to the first
+ * sample boundary at or after the access (whole samples). Timer A counts
+ * samples, timer B is charged per catch-up in one step; status bits 0/1 are
+ * the timers' overflow flags (no busy flag). Audio stays the engine's ymfm
+ * path: this is only the CPU-visible timing. */
+#define FM_SAMPLE 1008u
+static uint32_t s_fm_count;              /* master clock of the next sample   */
+static int      s_fm_ta, s_fm_tal = 1024, s_fm_tac, s_fm_tbl = 256 << 4, s_fm_tbc;
+static uint8_t  s_fm_mode, s_fm_status;
+static uint16_t s_fm_addr;
+
+static void fm_update(uint32_t t)
+{
+    if (t <= s_fm_count) return;
+    uint32_t n = (t - s_fm_count + FM_SAMPLE - 1) / FM_SAMPLE;
+    for (uint32_t i = 0; i < n; i++) {
+        if (s_fm_mode & 0x01) {
+            if (--s_fm_tac <= 0) {
+                if (s_fm_mode & 0x04) s_fm_status |= 0x01;
+                s_fm_tac = s_fm_tal;
+            }
+        }
+    }
+    if (s_fm_mode & 0x02) {
+        s_fm_tbc -= (int)n;
+        if (s_fm_tbc <= 0) {
+            if (s_fm_mode & 0x08) s_fm_status |= 0x02;
+            if (s_fm_tbl) s_fm_tbc += s_fm_tbl; else s_fm_tbc = s_fm_tbl;
+        }
+    }
+    s_fm_count += n * FM_SAMPLE;
+}
+
+static void fm_set_timers(uint8_t v)
+{
+    if ((v & 1) && !(s_fm_mode & 1)) s_fm_tac = s_fm_tal;
+    if ((v & 2) && !(s_fm_mode & 2)) s_fm_tbc = s_fm_tbl;
+    s_fm_status &= (uint8_t)(~v >> 4);
+    s_fm_mode = v;
+}
+
+static void fm_reset_chip(uint32_t t)
+{
+    fm_update(t);
+    s_fm_tac = s_fm_tbc = 0;
+    fm_set_timers(0x30);
+    s_fm_tbl = 256 << 4;
+    s_fm_ta = 0;
+    s_fm_tal = 1024;
+}
+
+uint8_t exact_ym_read(uint32_t t)
+{
+    fm_update(t);
+    return s_fm_status;
+}
+
+void exact_ym_write(uint32_t t, unsigned port, uint8_t v)
+{
+    if (port & 1) fm_update(t);
+    switch (port & 3) {
+    case 0: s_fm_addr = v; break;
+    case 2: s_fm_addr = (uint16_t)(v | 0x100); break;
+    default:
+        switch (s_fm_addr) {
+        case 0x24: s_fm_ta = (s_fm_ta & 0x03) | (v << 2); s_fm_tal = 1024 - s_fm_ta; break;
+        case 0x25: s_fm_ta = (s_fm_ta & 0x3FC) | (v & 3); s_fm_tal = 1024 - s_fm_ta; break;
+        case 0x26: s_fm_tbl = (256 - v) << 4; break;
+        case 0x27: fm_set_timers(v); break;
+        default: break;
+        }
+        break;
+    }
 }
 
 /* ======================================================================== */
@@ -825,6 +916,9 @@ void exact_reset(void)
     s_pad_counter[0] = s_pad_counter[1] = 0;
     s_pad_timeout[0] = s_pad_timeout[1] = 0;
     s_zclk = 0; s_zstate = 0; s_zirq = 0; s_zaccess = 0;
+    s_fm_count = 0; s_fm_ta = 0; s_fm_tal = 1024; s_fm_tac = 0; s_fm_tbl = 256 << 4; s_fm_tbc = 0;
+    s_fm_mode = 0x30; s_fm_status = 0; s_fm_addr = 0;
+    { extern void machine_z80_exact_power_on(void); machine_z80_exact_power_on(); }
     g_machine.bus.z80_busreq = 0; g_machine.bus.z80_reset_off = 0;
     memset(g_machine.vdp.reg, 0, sizeof g_machine.vdp.reg);
     g_machine.vdp.code = 0; g_machine.vdp.address = 0;
@@ -855,6 +949,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
 
     s_frame_no++;
     trace_frame_begin();
+    { extern void machine_z80_trace_frame(unsigned long long); machine_z80_trace_frame(s_frame_no); }
     s_mline = 0;
     s_vcounter = LINES - 1;
     s_fifo_write_cnt = 0;
@@ -866,7 +961,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     }
     s_status &= 0xFEE5;
     s_status |= 0x0200;
-    if (s_dma_length) dma_update(0);
+    if (s_dma_length) dma_update_at(0, 0);
 
     run_line_end(MPL);
     s_mline += MPL;
@@ -875,7 +970,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
         s_vcounter = line;
         input_refresh();
         hint_tick(&h_counter);
-        if (s_dma_length) dma_update(s_mline);
+        if (s_dma_length) dma_update_at(s_mline, 0);
         machine_render_line(line, sink, user);
         run_line_end(s_mline + MPL);
         s_mline += MPL;
@@ -886,7 +981,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     v->in_vblank = 1;
     input_refresh();
     hint_tick(&h_counter);
-    if (s_dma_length) dma_update(s_mline);
+    if (s_dma_length) dma_update_at(s_mline, 0);
     m68k_run(s_mline + 588);
     s_status |= 0x80;                              /* VINT flag */
     run_line_end(s_mline + 788);
@@ -910,6 +1005,8 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     } while (++line < LINES - 1);
 
     v->in_vblank = 0;
+    fm_update(s_mline);                            /* the frame's last FM samples */
+    s_fm_count -= s_mline;
     g_xclk   -= s_mline;
     g_xstart -= s_mline;
     s_zclk   -= s_mline;

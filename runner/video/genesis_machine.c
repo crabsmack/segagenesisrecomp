@@ -9,6 +9,7 @@
 #endif
 #include "genesis_dac.h"  /* authentic Genesis output-DAC color ladder */
 #include "chip_trace.h"   /* [CHIP-TRACE] shared FM/PSG stream ring + g_snd_* globals */
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>   /* [SND-TRACE] temporary sound-command lifecycle trace */
 
@@ -492,18 +493,75 @@ void machine_render_line(int line, GenesisScanlineSink sink, void *user)
     }
 }
 
-/* Run the Z80 to master clock `target` (15 master clocks per T-state). */
+/* Exact-mode Z80 trace (GENESIS_ZTRACE=from,to,path): frame,pc,zclk,rh per
+ * instruction, rh = word-wise FNV-1a over AF BC DE HL IX IY SP AF' BC' DE' HL',
+ * comparable with the reference's emu/cycle_trace.py --z80-out. */
+static FILE    *s_ztrace_f;
+static unsigned long long s_ztrace_on;   /* frame number while tracing, else 0 */
+/* Z80 time during an exact step: the instruction's cycles are charged before it
+ * executes (as in the reference), so an access happens at its end. */
+static uint32_t      s_znow_base;
+static unsigned long s_znow_cyc;
+uint32_t machine_z80_now(void)
+{
+    return s_znow_base + (uint32_t)(g_machine.z80.cyc - s_znow_cyc) * MASTER_PER_Z80;
+}
+static unsigned long long s_ztrace_from, s_ztrace_to;
+void machine_z80_trace_frame(unsigned long long frame)
+{
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("GENESIS_ZTRACE");
+        char path[512] = "";
+        if (e && sscanf(e, "%llu,%llu,%511s", &s_ztrace_from, &s_ztrace_to, path) == 3) {
+            s_ztrace_f = fopen(path, "w");
+            if (s_ztrace_f) fprintf(s_ztrace_f, "frame,pc,zclk,rh\n");
+        }
+    }
+    if (s_ztrace_f) fflush(s_ztrace_f);
+    s_ztrace_on = s_ztrace_f && frame >= s_ztrace_from && frame <= s_ztrace_to ? frame : 0;
+}
+
+static void z80_trace_one(const z80 *z, uint32_t zclk)
+{
+    uint8_t f = (uint8_t)((z->sf << 7) | (z->zf << 6) | (z->yf << 5) | (z->hf << 4) |
+                          (z->xf << 3) | (z->pf << 2) | (z->nf << 1) | z->cf);
+    uint32_t v[11] = { (uint32_t)(z->a << 8 | f), (uint32_t)(z->b << 8 | z->c),
+                       (uint32_t)(z->d << 8 | z->e), (uint32_t)(z->h << 8 | z->l),
+                       z->ix, z->iy, z->sp, (uint32_t)(z->a_ << 8 | z->f_),
+                       (uint32_t)(z->b_ << 8 | z->c_), (uint32_t)(z->d_ << 8 | z->e_),
+                       (uint32_t)(z->h_ << 8 | z->l_) };
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 11; i++) h = (h ^ v[i]) * 16777619u;
+    fprintf(s_ztrace_f, "%llu,%04X,%u,%08X\n", s_ztrace_on,
+            (unsigned)(z->halted ? (uint16_t)(z->pc - 1) : z->pc), zclk, h);
+}
+
+/* Run the Z80 to master clock `target` (15 master clocks per T-state), in the
+ * reference's order: a pending interrupt is taken BEFORE an instruction (not
+ * in an EI shadow), then one instruction runs. */
 void machine_z80_exact_step(uint32_t *zclk, uint32_t target)
 {
     GenesisMachine *m = &g_machine;
+    static int ei_shadow;
     while (*zclk < target) {
         s_line_base = 0;
         s_z80_off = *zclk;                 /* audio stamp: frame-relative master */
 #ifdef GENESIS_Z80_RECOMP
         *zclk += z80_recomp_step_one() * MASTER_PER_Z80;
 #else
+        if (!ei_shadow) {
+            unsigned long c0 = m->z80.cyc;
+            if (z80_take_irq(&m->z80)) {
+                *zclk += (uint32_t)(m->z80.cyc - c0) * MASTER_PER_Z80;
+                if (*zclk >= target) break;
+            }
+        }
+        if (s_ztrace_on) z80_trace_one(&m->z80, *zclk);
         unsigned long c0 = m->z80.cyc;
-        z80_step(&m->z80);
+        s_znow_base = *zclk; s_znow_cyc = c0;
+        ei_shadow = z80_exec_one(&m->z80);
         *zclk += (uint32_t)(m->z80.cyc - c0) * MASTER_PER_Z80;
 #endif
     }
@@ -516,7 +574,22 @@ void machine_z80_exact_reset(void)
     z80_recomp_mirror_to_interpreter(&g_machine.z80);
 #else
     z80_own_reset(&g_machine.z80);
+    g_machine.z80.i = 0;           /* the reset line also clears I and R */
+    g_machine.z80.r = 0;
 #endif
+}
+
+/* Exact-mode power-on register file: every register pair 0 with only Z set in
+ * F (the reference's power-on state; reset leaves these untouched). */
+void machine_z80_exact_power_on(void)
+{
+    z80 *z = &g_machine.z80;
+    z->a = z->b = z->c = z->d = z->e = z->h = z->l = 0;
+    z->a_ = z->b_ = z->c_ = z->d_ = z->e_ = z->h_ = z->l_ = z->f_ = 0;
+    z->sp = z->ix = z->iy = 0;
+    z->mem_ptr = 0;
+    z->sf = 0; z->zf = 1; z->yf = 0; z->hf = 0; z->xf = 0; z->pf = 0; z->nf = 0; z->cf = 0;
+    machine_z80_exact_reset();
 }
 
 void machine_z80_exact_irq(int asserted)

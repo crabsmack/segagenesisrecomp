@@ -8,6 +8,7 @@
  */
 #include "genesis_bus.h"
 #include "../audio/event_queue.h"
+#include "../exact_sched.h"   /* g_exact: cycle-exact YM timer model */
 #include <string.h>
 
 /* Recompiled 68K memory. */
@@ -482,6 +483,7 @@ uint8_t gbus_z80_read(GenesisBus *b, uint16_t addr)
     if (addr < 0x4000u) return b->z80_ram[addr & 0x1FFFu];         /* RAM+mirror */
     /* YM2612 status: BUSY is clear; timer flags advance on scheduler time. */
     if (addr < 0x6000u) {
+        if (g_exact) return exact_ym_read(machine_z80_now());
         ym_timer_update(b, ym_abs_z80_stamp());
         return b->ym_status;
     }
@@ -498,6 +500,7 @@ void gbus_z80_write(GenesisBus *b, uint16_t addr, uint8_t val)
         b->z80_ram[off] = val; return; }                           /* RAM+mirror */
     if (addr < 0x6000u) {
         uint8_t port = (uint8_t)(addr & 3);
+        if (g_exact) exact_ym_write(machine_z80_now(), port, val);
         ym_write_side_effect(b, port, val, ym_abs_z80_stamp());
         CHIP_PC_Z80(); audio_event_push(machine_z80_stamp(), port, val); return;
     } /* FM */

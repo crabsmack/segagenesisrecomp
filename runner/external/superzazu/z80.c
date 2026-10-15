@@ -770,6 +770,44 @@ void z80_step(z80* const z) {
   process_interrupts(z);
 }
 
+// MAME-order stepping (segagenesisrecomp exact timing). The caller checks for
+// a maskable interrupt BEFORE each instruction with z80_take_irq (returns 1 if
+// one was taken: halt left, flip-flops cleared, mode 1/2/0 entry with its
+// latency in z->cyc), then runs one instruction with z80_exec_one. EI enables
+// immediately; z80_exec_one returns 1 after an EI so the caller skips the
+// interrupt check before the next instruction (the EI shadow).
+int z80_take_irq(z80* const z) {
+  if (!(z->int_pending && z->iff1)) return 0;
+  z->int_pending = 0;
+  z->halted = 0;
+  z->iff1 = 0;
+  z->iff2 = 0;
+  inc_r(z);
+  switch (z->interrupt_mode) {
+  case 0: z->cyc += 11; exec_opcode(z, z->int_data); break;
+  case 1: z->cyc += 13; call(z, 0x38); break;
+  case 2: z->cyc += 19; call(z, rw(z, (z->i << 8) | z->int_data)); break;
+  default: break;
+  }
+  return 1;
+}
+
+int z80_exec_one(z80* const z) {
+  if (z->halted) {
+    exec_opcode(z, 0x00);
+  } else {
+    const uint8_t opcode = nextb(z);
+    exec_opcode(z, opcode);
+  }
+  if (z->iff_delay > 0) {
+    z->iff_delay = 0;
+    z->iff1 = 1;
+    z->iff2 = 1;
+    return 1;
+  }
+  return 0;
+}
+
 // outputs to stdout a debug trace of the emulator
 void z80_debug_output(z80* const z) {
   printf("PC: %04X, AF: %04X, BC: %04X, DE: %04X, HL: %04X, SP: %04X, "
