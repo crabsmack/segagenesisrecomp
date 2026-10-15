@@ -151,17 +151,27 @@ static void irq_ack(unsigned level)
 
 static void force_boundary(void) { g_xend = 0; }
 
-static void set_irq(unsigned level)          { s_int_level = level; force_boundary(); }
-static void update_irq(unsigned level)       { if (level > s_int_level) s_int_level = level; force_boundary(); }
+/* When the 68000 looks at its interrupt input (as the reference does):
+ * - at the start of every time slice;
+ * - right after an SR write (MOVE/ANDI/ORI/EORI to SR, RTE) — before the
+ *   slice-end test, so an unmasked pending interrupt is taken even at a slice
+ *   boundary;
+ * - after the IRQ-latency instruction that follows a VDP register write
+ *   enabling a pending interrupt.
+ * Raising or lowering the input alone (set_irq, update_irq) is not a check. */
+static int s_check_now;
+
+static void set_irq(unsigned level)          { s_int_level = level; }
+static void update_irq(unsigned level)       { s_int_level |= level; }
 static void set_irq_delay(unsigned level)
 {
-    /* Raised by a VDP register write enabling a pending interrupt: the 68000
-     * finishes the writing instruction and executes ONE more before taking it,
-     * unless the write came from a MOVE.L (the reference cannot split one),
-     * in which case it is taken right after the MOVE.L. */
+    /* The 68000 finishes the writing instruction and executes ONE more before
+     * the check, unless the write came from a MOVE.L (the reference cannot
+     * split one), in which case the check follows the MOVE.L. */
     if (!s_irq_latency) {
         uint16_t op = (uint16_t)((g_rom[g_xpc & 0x3FFFFFu] << 8) | g_rom[(g_xpc + 1) & 0x3FFFFFu]);
         if ((op & 0xF000) != 0x2000) s_irq_latency = 1;
+        else                         s_check_now = 1;
     }
     s_int_level = level;
     force_boundary();
@@ -203,30 +213,37 @@ static void take_interrupt(uint32_t pc, unsigned level)
  * until the scheduler gives it more time) and/or an interrupt is due. */
 void x68k_slice(uint32_t pc)
 {
+    if (s_irq_latency == 1) {             /* run exactly one more instruction */
+        s_irq_latency = 2;                /* (inline in the reference: no slice test) */
+        s_irq_latency_pc = pc;
+        g_xend = 0;                       /* check at the next boundary */
+        return;
+    }
     for (;;) {
+        /* An immediate check: after an SR write or an IRQ-latency slot, and
+         * after a handler's RTE (which is an SR write) — so back-to-back
+         * interrupts are taken before the interrupted instruction resumes. */
+        if (s_irq_latency == 2 || s_check_now) {
+            s_irq_latency = 0;
+            s_check_now = 0;
+            if (s_int_level > ((g_cpu.SR >> 8) & 7u)) {
+                take_interrupt(pc, s_int_level);
+                continue;
+            }
+        }
         if (g_xclk >= s_end) {
             g_xend = s_end;
             glue_exact_park();            /* returns at the start of a new slice */
+            if (s_int_level > ((g_cpu.SR >> 8) & 7u))
+                take_interrupt(pc, s_int_level);
             continue;
-        }
-        if (s_irq_latency == 1) {         /* run exactly one more instruction */
-            s_irq_latency = 2;
-            s_irq_latency_pc = pc;
-            g_xend = 0;                   /* stop again at the next boundary */
-            return;
-        }
-        s_irq_latency = 0;
-        unsigned mask = (g_cpu.SR >> 8) & 7u;
-        if (s_int_level > mask) {
-            take_interrupt(pc, s_int_level);
-            continue;                     /* the handler may have ended the slice */
         }
         break;
     }
     g_xend = s_end;
 }
 
-void x68k_sr_written(void) { force_boundary(); }
+void x68k_sr_written(void) { s_check_now = 1; force_boundary(); }
 
 void x68k_divide_by_zero(uint32_t next_pc)
 {
@@ -606,19 +623,47 @@ static uint16_t vdp_ctrl_r(uint32_t now)
 
 uint16_t exact_peek_status(void) { return s_status; }
 
-/* H counter: approximate until a reference trace exercises it (TODO). */
+/* H counter value at each master clock of a line. The counter steps through
+ * runs of consecutive values, each held for a fixed number of master clocks
+ * (H40: 16 per pixel pair, longer around HSYNC; H32: 20). {first value,
+ * number of consecutive values, clocks each}; values wrap at $FF. */
+static const uint16_t s_hc40_segs[][3] = {
+    { 0xA5, 17, 16 }, { 0xB6, 1, 8 }, { 0xE4, 1, 8 }, { 0xE5, 1, 16 }, { 0xE6, 1, 17 },
+    { 0xE7, 3, 20 }, { 0xEA, 1, 18 }, { 0xEB, 3, 20 }, { 0xEE, 2, 19 }, { 0xF0, 3, 20 },
+    { 0xF3, 1, 18 }, { 0xF4, 3, 20 }, { 0xF7, 1, 17 }, { 0xF8, 173, 16 } };
+static const uint16_t s_hc32_segs[][3] = { { 0x85, 15, 20 }, { 0xE9, 156, 20 } };
+static uint8_t s_hc40[MPL], s_hc32[MPL];
+
+static void hc_tables_init(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    unsigned i = 0;
+    for (unsigned s = 0; s < sizeof s_hc40_segs / sizeof s_hc40_segs[0]; s++)
+        for (unsigned v = 0; v < s_hc40_segs[s][1]; v++)
+            for (unsigned c = 0; c < s_hc40_segs[s][2] && i < MPL; c++)
+                s_hc40[i++] = (uint8_t)(s_hc40_segs[s][0] + v);
+    i = 0;
+    for (unsigned s = 0; s < sizeof s_hc32_segs / sizeof s_hc32_segs[0]; s++)
+        for (unsigned v = 0; v < s_hc32_segs[s][1]; v++)
+            for (unsigned c = 0; c < s_hc32_segs[s][2] && i < MPL; c++)
+                s_hc32[i++] = (uint8_t)(s_hc32_segs[s][0] + v);
+}
+
 static uint16_t hv_counter(uint32_t now)
 {
     uint32_t data = s_hvc_latch;
     if (data) {
-        if (REG(1) & 0x04) return (uint16_t)(data & 0xFFFF);
+        if (REG(1) & 0x04) return (uint16_t)(data & 0xFFFF);  /* latched (mode 5) */
         data &= 0xFF;
     } else {
-        uint32_t c = now % MPL;
-        data = (REG(12) & 1) ? (c * 210u / MPL) : (c * 171u / MPL);
+        hc_tables_init();
+        data = (REG(12) & 1) ? s_hc40[now % MPL] : s_hc32[now % MPL];
     }
-    int vc = (int)(now / MPL) - 1;
-    int vc_max = (REG(1) & 0x04) ? ((REG(1) & 0x08) ? 0x10A : 0xEA) : 0xDA;
+    int vc = (int)(now / MPL) - 1;              /* the frame starts at line -1 */
+    static const int vc_table[4] = { 0xDA, 0xEA, 0xDA, 0x106 };
+    int vc_max = vc_table[(REG(1) >> 2) & 3];
     if (vc > vc_max) vc -= LINES;
     return (uint16_t)(data | ((vc & 0xFF) << 8));
 }
