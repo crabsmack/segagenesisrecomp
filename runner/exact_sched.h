@@ -50,6 +50,12 @@ uint16_t xbus_read16(uint32_t a);
 void     xbus_write8 (uint32_t a, uint8_t v);
 void     xbus_write16(uint32_t a, uint16_t v);
 
+/* YM2612 timer/status model (CPU-visible timing; t = master clock). */
+uint8_t exact_ym_read(uint32_t t);
+void    exact_ym_write(uint32_t t, unsigned port, uint8_t v);
+/* Z80 time of the current access (genesis_machine.c, during a Z80 step). */
+uint32_t machine_z80_now(void);
+
 /* Host inspection (no side effects). */
 uint16_t exact_peek_status(void);
 

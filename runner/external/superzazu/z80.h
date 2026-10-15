@@ -37,5 +37,7 @@ void z80_step(z80* const z);
 void z80_debug_output(z80* const z);
 void z80_gen_nmi(z80* const z);
 void z80_gen_int(z80* const z, uint8_t data);
+int z80_take_irq(z80* const z);
+int z80_exec_one(z80* const z);
 
 #endif // Z80_Z80_H_
