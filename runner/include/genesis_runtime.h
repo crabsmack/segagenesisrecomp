@@ -287,6 +287,9 @@ extern uint64_t g_xirq_taken;
  * now is taken while the old mask still allows it. */
 void x68k_sr_pre(void);
 #define XSRP() x68k_sr_pre()
+/* The frame-synchronous stepped runner takes the V-int now (a wait for it with no sync point);
+   any other runner: nothing (exact_sched.c). */
+void x68k_wait_vint(uint32_t pc);
 
 /* Operand-dependent MUL/DIV time in master clocks (the standard 68000 timing
  * algorithms: MULU 38+2n for n set bits, MULS 38+2n for n 01/10 pairs, DIVU

@@ -1222,6 +1222,17 @@ static void fsync_vint(void)
     if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) take_interrupt(g_xpc, 6);
 }
 
+/* The main program waits for the V-int without a sync point: it spins on a RAM flag only the
+   V-int handler sets (X-Men 2's two-player half-rate wait, before VDP_WaitVBlank). A timed run
+   gets the V-int mid-frame; the frame-synchronous one takes it only at sync points, so the
+   game calls this from the wait (a game_hook site, or the hand C's IRQ_WAIT) and the V-int is
+   taken now. Elsewhere a no-op. */
+void x68k_wait_vint(uint32_t pc)
+{
+    if (!s_fsync) return;
+    if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) take_interrupt(pc, 6);
+}
+
 
 static uint16_t fsync_read(uint32_t a, uint8_t size)
 {
