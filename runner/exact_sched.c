@@ -266,9 +266,11 @@ void x68k_slice(uint32_t pc)
 
 void x68k_sr_pre(void) { if (s_replay) rp_take_pending(); }
 
+int g_xirq_hold;
+
 void x68k_sr_written(void)
 {
-
+    if (g_xirq_hold) return;                        /* an untimed run: no interrupt */
     if (s_replay) { rp_take_pending(); return; }    /* an unmasked replayed interrupt */
     if (s_stepped) return;
     s_check_now = 1;
