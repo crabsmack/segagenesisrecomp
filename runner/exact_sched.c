@@ -1127,6 +1127,20 @@ static void pos_irq_leave(void)
 static void fsync_vint(void);
 static void fsync_z80_frame(void);
 
+/* The frame-synchronous runner's picture: the whole frame from the VDP as the V-int handler left
+   it, which is what the active display shows (minus mid-frame raster changes: no H-int here, and
+   the main program's VDP writes show from the next frame). Into the sink of the exact_run_frame
+   that resumed the game. */
+static GenesisScanlineSink s_fs_sink;
+static void *s_fs_user;
+
+static void fsync_render(void)
+{
+    extern void machine_render_line(int line, GenesisScanlineSink sink, void *user);
+    int h = (REG(1) & 0x04) ? ((REG(1) & 0x08) ? 240 : 224) : 192;
+    for (int line = 0; line < h; line++) machine_render_line(line, s_fs_sink, s_fs_user);
+}
+
 static void sync_point(void)
 {
     uint64_t frame = s_frame_no;
@@ -1144,7 +1158,10 @@ static void sync_point(void)
     }
     if (g_game_spec.on_sync) g_game_spec.on_sync(s_sync_no, frame);
     if (s_stepped) glue_exact_park();          /* one runner frame per sync interval */
-    if (s_fsync) fsync_vint();                 /* frame-synchronous: the V-int is taken here */
+    if (s_fsync) {                             /* frame-synchronous: the V-int is taken here */
+        fsync_vint();
+        fsync_render();
+    }
 }
 
 int x68k_entry(uint32_t addr)
@@ -1513,12 +1530,19 @@ void exact_ym_write(uint32_t t, unsigned port, uint8_t v)
 /* Frame                                                                     */
 
 /* The Z80's frame: its V-int line for one line, the rest of the frame, then the YM sample
-   clock re-anchors (as exact_run_frame does). Time inside a frame is the Z80's own. */
+   clock re-anchors (as exact_run_frame does). Time inside a frame is the Z80's own. The V-int
+   line starts where the Z80 is: the 8-line slices of the 68000's bus releases have usually run
+   it well past the frame's first line, and an IRQ held only there was never taken (X-Men 2's
+   driver, paced by it, went silent after its init). */
 static void fsync_z80_frame(void)
 {
     const uint32_t F = LINES * MPL;
     for (int i = 0; i < 262; i++) input_refresh();
-    if (s_zstate == 1) { machine_z80_exact_irq(1); if (s_zclk < MPL) machine_z80_exact_step(&s_zclk, MPL); machine_z80_exact_irq(0); }
+    if (s_zstate == 1) {
+        machine_z80_exact_irq(1);
+        machine_z80_exact_step(&s_zclk, s_zclk + MPL);
+        machine_z80_exact_irq(0);
+    }
     if (s_zstate == 1 && s_zclk < F) machine_z80_exact_step(&s_zclk, F);
     if (s_zclk < F) s_zclk = F;
     fm_update(F);
@@ -1589,8 +1613,9 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     if (s_stepped) {                  /* no clock: run to the next sync point */
         s_frame_no++;
         if (s_fsync) fsync_z80_frame();
+        s_fs_sink = sink;
+        s_fs_user = user;
         if (!s_rp_done) glue_exact_resume();
-        (void)sink; (void)user;
         return;
     }
     s_frame_no++;
