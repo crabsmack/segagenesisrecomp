@@ -1348,21 +1348,39 @@ uint8_t xbus_read8(uint32_t a)
     return dev_read8(a);
 }
 
+/* The devices behind a write, after the hook: a CPU access reaches g_xhw_hook once, also when
+   the bus turns it into another width (a VDP byte write is a word of the byte twice, a PSG or
+   Z80-area word write a byte), so a verification harness logs one access per instruction. */
+static void vdp_w16(uint32_t a, uint16_t v)
+{
+    switch (a & 0x1C) {
+    case 0x00: vdp_data_w(v); return;
+    case 0x04: vdp_ctrl_w(v); return;
+    case 0x10: case 0x14: gbus_write8(&g_machine.bus, 0xC00011u, (uint8_t)v); return;   /* PSG */
+    default: return;
+    }
+}
+
+static void z80_area_w8(uint32_t a, uint8_t v)
+{
+    if (!s_zaccess) return;
+    if ((a & 0x6000) == 0x0000 || (a & 0x6000) == 0x2000) {
+        g_machine.bus.z80_ram[a & 0x1FFF] = v;
+        g_xstart += 8; g_xclk += 8;                       /* Z80 RAM access latency */
+        return;
+    }
+    if ((a & 0x6000) == 0x4000) exact_ym_write(g_xstart, a & 3, v);
+    gbus_write8(&g_machine.bus, a, v);                     /* YM2612 audio / bank */
+}
+
 void xbus_write16(uint32_t a, uint16_t v)
 {
     a &= 0xFFFFFFu;
     if (s_shared && a >= 0xFF0000u) shared_mark(a, 2, 1);
     if (a >= 0xFF0000u) { g_ram[a & 0xFFFF] = (uint8_t)(v >> 8); g_ram[(a + 1) & 0xFFFF] = (uint8_t)v; return; }
     if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 2, 2, v, NULL)) return;
-    if (vdp_port(a)) {
-        switch (a & 0x1C) {
-        case 0x00: vdp_data_w(v); return;
-        case 0x04: vdp_ctrl_w(v); return;
-        case 0x10: case 0x14: xbus_write8(a | 1, (uint8_t)v); return;   /* PSG */
-        default: return;
-        }
-    }
-    if (a >= 0xA00000u && a < 0xA10000u) { xbus_write8(a, (uint8_t)(v >> 8)); return; }
+    if (vdp_port(a)) { vdp_w16(a, v); return; }
+    if (a >= 0xA00000u && a < 0xA10000u) { z80_area_w8(a, (uint8_t)(v >> 8)); return; }
     if (a >= 0xA10000u && a < 0xA10020u) { io_write((a >> 1) & 0x0F, (uint8_t)v); return; }
     if (a == 0xA11100u) { z80_busreq_w((v >> 8) & 1, g_xstart); return; }
     if (a == 0xA11200u) { z80_reset_w((v >> 8) & 1, g_xstart); return; }
@@ -1375,23 +1393,13 @@ void xbus_write8(uint32_t a, uint8_t v)
     if (s_shared && a >= 0xFF0000u) shared_mark(a, 1, 1);
     if (a >= 0xFF0000u) { g_ram[a & 0xFFFF] = v; return; }
     if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 1, 2, v, NULL)) return;
-    if (a >= 0xA00000u && a < 0xA10000u) {
-        if (!s_zaccess) return;
-        if ((a & 0x6000) == 0x0000 || (a & 0x6000) == 0x2000) {
-            g_machine.bus.z80_ram[a & 0x1FFF] = v;
-            g_xstart += 8; g_xclk += 8;                       /* Z80 RAM access latency */
-            return;
-        }
-        if ((a & 0x6000) == 0x4000) exact_ym_write(g_xstart, a & 3, v);
-        gbus_write8(&g_machine.bus, a, v);                     /* YM2612 audio / bank */
-        return;
-    }
+    if (a >= 0xA00000u && a < 0xA10000u) { z80_area_w8(a, v); return; }
     if (a >= 0xA10000u && a < 0xA10020u) { if (a & 1) io_write((a >> 1) & 0x0F, v); return; }
     if (a == 0xA11100u) { z80_busreq_w(v & 1, g_xstart); return; }
     if (a == 0xA11200u) { z80_reset_w(v & 1, g_xstart); return; }
     if (vdp_port(a)) {
         if ((a & 0x1C) == 0x10 || (a & 0x1C) == 0x14) { gbus_write8(&g_machine.bus, 0xC00011u, v); return; }
-        xbus_write16(a & ~1u, (uint16_t)(v << 8 | v));
+        vdp_w16(a & ~1u, (uint16_t)(v << 8 | v));
         return;
     }
     gbus_write8(&g_machine.bus, a, v);
