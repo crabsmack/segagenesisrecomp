@@ -16,6 +16,7 @@
 #include "audio/ym2612.h"
 #include "audio/sn76489.h"
 #include "audio/event_queue.h"
+#include "exact_sched.h"              /* exact_rb_save/load (exact-timing games) */
 
 /* ---- drift guards -----------------------------------------------------------
  * These pin the layouts the sections serialize. A failing assert means a
@@ -156,6 +157,8 @@ static const RbSection k_sections[] = {
     { "exec",    GENESIS_RB_PART_EXEC,  glue_rb_exec_save,  glue_rb_exec_load,  digest_exec    },
     { "cpu",     GENESIS_RB_PART_CPU,   sec_cpu_save,       sec_cpu_load,       digest_bytes   },
     { "sched",   GENESIS_RB_PART_SCHED, glue_rb_sched_save, glue_rb_sched_load, digest_bytes   },
+    /* the exact scheduler (GameSpec.exact_timing; empty otherwise), digested as scheduling */
+    { "exact",   GENESIS_RB_PART_SCHED, exact_rb_save,      exact_rb_load,      digest_bytes   },
     { "ram",     GENESIS_RB_PART_RAM,   sec_ram_save,       sec_ram_load,       digest_bytes   },
     { "machine", GENESIS_RB_PART_VDP,   machine_rb_save,    machine_rb_load,    digest_machine },
     { "fm",      GENESIS_RB_PART_FM,    sec_fm_save,        sec_fm_load,        digest_bytes   },

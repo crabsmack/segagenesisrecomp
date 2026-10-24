@@ -1407,6 +1407,125 @@ int runner_write_screenshot_file(const char *path)
 }
 
 /* =========================================================================
+ * Branch plans (--branch-plan FILE; offline --benchmark runs only)
+ *
+ * Several runs that share their first frames' input with this one play
+ * from where they leave it instead of from power-on. Each plan line is
+ * `FRAME FRAMES TAG SCRIPT`: once this run has played FRAME frames, the
+ * machine is snapshotted (rb_state.h, in this process: the game fiber's
+ * stack holds host addresses), SCRIPT is played for FRAMES more frames
+ * (its first FRAME frames being this run's input), the game writes the
+ * branch's outputs (GameSpec.branch_end(TAG)), and the snapshot is put back.
+ * Lines are in FRAME order; several may share one. A branch is the run
+ * SCRIPT plays from power-on, without its first FRAME frames: what the game
+ * keeps outside the snapshot goes through GameSpec.branch_save/restore.
+ * Each branch prints `GENESISRECOMP_BRANCH {...}` on stdout.
+ * ========================================================================= */
+
+typedef struct { uint32_t at, frames; char tag[128]; char script[520]; } BranchItem;
+static BranchItem *s_br;
+static int         s_br_n, s_br_i;
+static int         s_br_active;          /* a branch is playing */
+static uint32_t    s_br_end;             /* the frame it ends at */
+static uint32_t    s_br_saved_at = UINT32_MAX;   /* the frame the snapshot is of */
+static uint8_t    *s_br_blob;
+static size_t      s_br_len;
+static const char *s_br_carrier;         /* this run's own input script */
+static Uint64      s_br_t0;
+
+static int branch_plan_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "[branch] cannot read %s\n", path); return 0; }
+    char line[800];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        BranchItem b;
+        int used = 0;
+        if (line[0] == '#' || strspn(line, " \t\r\n") == strlen(line)) continue;
+        if (sscanf(line, "%u %u %127s %n", &b.at, &b.frames, b.tag, &used) != 3 || !used) {
+            fprintf(stderr, "[branch] %s: bad line: %s", path, line);
+            fclose(f); return 0;
+        }
+        snprintf(b.script, sizeof b.script, "%s", line + used);
+        b.script[strcspn(b.script, "\r\n")] = 0;
+        if (!b.script[0] || (n && b.at < s_br[n - 1].at)) {
+            fprintf(stderr, "[branch] %s: no script, or a line before the previous one's frame: %s", path, line);
+            fclose(f); return 0;
+        }
+        BranchItem *nb = (BranchItem *)realloc(s_br, (size_t)(n + 1) * sizeof *s_br);
+        if (!nb) { fclose(f); return 0; }
+        s_br = nb;
+        s_br[n++] = b;
+    }
+    fclose(f);
+    s_br_n = n;
+    fprintf(stderr, "[branch] %d branches from %s\n", n, path);
+    return 1;
+}
+
+/* SCRIPT where it stands after `frame` frames of this run: loaded and ticked
+ * through them as the main loop ticks it (input-only scripts: the ticks do
+ * nothing but advance it). */
+static void branch_script_seek(const char *script, uint32_t frame)
+{
+    extern int g_exact;
+    if (!input_script_load(script) || input_script_mutates_state()) {
+        fprintf(stderr, "[branch] %s: not an input-only script\n", script);
+        exit(2);
+    }
+    if (g_exact) input_script_tick(0, glue_peek8, glue_peek16, glue_poke8, glue_poke16, glue_poke32);
+    for (uint32_t f = 1; f <= frame; f++)
+        input_script_tick(f, glue_peek8, glue_peek16, glue_poke8, glue_poke16, glue_poke32);
+}
+
+/* After the main loop has played (and ticked the script for) frame *frame_num. */
+static void branch_tick(uint32_t *frame_num)
+{
+    for (;;) {
+        if (s_br_active) {
+            if (*frame_num < s_br_end) return;
+            const BranchItem *b = &s_br[s_br_i];
+            if (g_game_spec.branch_end) g_game_spec.branch_end(b->tag);
+            printf("GENESISRECOMP_BRANCH {\"tag\": \"%s\", \"at\": %u, \"frames\": %u, \"complete\": true, "
+                   "\"seconds\": %.3f}\n", b->tag, (unsigned)b->at, (unsigned)b->frames,
+                   (double)(SDL_GetPerformanceCounter() - s_br_t0) / (double)SDL_GetPerformanceFrequency());
+            fflush(stdout);
+            if (!genesis_rb_load(s_br_blob, s_br_len)) {
+                fprintf(stderr, "[branch] restoring the snapshot of frame %u failed\n", (unsigned)s_br_saved_at);
+                exit(2);
+            }
+            if (g_game_spec.branch_restore) g_game_spec.branch_restore();
+            *frame_num = s_br_saved_at;
+            s_br_active = 0;
+            s_br_i++;
+            if (s_br_i >= s_br_n || s_br[s_br_i].at != *frame_num) {
+                branch_script_seek(s_br_carrier, *frame_num);
+                return;
+            }
+        }
+        if (s_br_i >= s_br_n || s_br[s_br_i].at != *frame_num) return;
+        const BranchItem *b = &s_br[s_br_i];
+        if (s_br_saved_at != *frame_num) {
+            size_t need = genesis_rb_bound();
+            uint8_t *nb = (uint8_t *)realloc(s_br_blob, need);
+            if (!nb || !(s_br_len = genesis_rb_save(nb, need))) {
+                fprintf(stderr, "[branch] snapshot at frame %u failed\n", (unsigned)*frame_num);
+                exit(2);
+            }
+            s_br_blob = nb;
+            s_br_saved_at = *frame_num;
+            if (g_game_spec.branch_save) g_game_spec.branch_save();
+        }
+        fprintf(stderr, "[branch] %s from frame %u, %u frames\n", b->tag, (unsigned)b->at, (unsigned)b->frames);
+        branch_script_seek(b->script, *frame_num);
+        s_br_end = *frame_num + b->frames;
+        s_br_active = 1;
+        s_br_t0 = SDL_GetPerformanceCounter();
+    }
+}
+
+/* =========================================================================
  * Frame logging (main-loop version, works in ALL build modes)
  * ========================================================================= */
 
@@ -2150,6 +2269,7 @@ int main(int argc, char *argv[])
      * for the format spec. Combined with --max-frames + --hash-frames,
      * makes the runner a one-shot regression-test driver. */
     const char *input_script_path = NULL;
+    const char *branch_plan_path = NULL;   /* --branch-plan FILE (see "Branch plans") */
 
     /* Pacing mode override: --pacing fiber|accurate or --pacing=...
      * NULL = not set via CLI (debug.ini may still override; otherwise
@@ -2239,6 +2359,8 @@ int main(int argc, char *argv[])
             hash_on_mode = 1;
         } else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc) {
             input_script_path = argv[++i];
+        } else if (strcmp(argv[i], "--branch-plan") == 0 && i + 1 < argc) {
+            branch_plan_path = argv[++i];
         } else if (strcmp(argv[i], "--exec-coverage-out") == 0 && i + 1 < argc) {
             exec_cov_out = argv[++i];
         } else if (strcmp(argv[i], "--yield-log") == 0) {
@@ -2544,6 +2666,14 @@ int main(int argc, char *argv[])
     /* --- Load input script (if requested) before the SDL window opens
      * so any parse error fails fast without a flash of black window. */
     if (input_script_path) input_script_load(input_script_path);
+    if (branch_plan_path) {
+        if (!benchmark_frames || !input_script_path) {
+            fprintf(stderr, "--branch-plan needs --benchmark N and --input-script\n");
+            return 2;
+        }
+        if (!branch_plan_load(branch_plan_path)) return 2;
+        s_br_carrier = input_script_path;
+    }
 
     /* --- Load symbol table for crash reports ---
      * Look for `annotations_from_disasm.csv` adjacent to the ROM.
@@ -3063,7 +3193,7 @@ session_begin:;
         (benchmark_frames || runtime_measure_frames) ? benchmark_process_cpu_cycles() : 0;
 
     while (running) {
-        if (max_frames && frame_num >= max_frames) break;
+        if (max_frames && frame_num >= max_frames && !s_br_active) break;
 #if GENESIS_HAS_RECOMP_NET
         if (s_offline_after_netplay && frame_num >= s_netplay_match_frames) break;
 #endif
@@ -3554,6 +3684,7 @@ session_begin:;
                 return input_script_exit_code();
             }
         }
+        if (s_br_n) branch_tick(&frame_num);
 
         /* FNV-1a-64 hash of the framebuffer's active region. Emitted
          * every `hash_frames` frames when --hash-frames is set so CI /

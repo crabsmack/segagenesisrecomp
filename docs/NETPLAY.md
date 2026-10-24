@@ -61,10 +61,14 @@ genesis_netplay_finish_frame
   rollback replay and the determinism probe. Adapters read players through
   `genesis_sim_pad(p)` / `genesis_sim_human_mask()` -- never SDL.
 - **Rollback state** (`runner/rb_state.{c,h}`): one section table (exec =
-  suspended game fiber + generated tail-frame head, cpu, sched, ram, machine,
-  fm, psg, evq, input, game) drives both the snapshot and the 12-partition
-  digest; each section's digest is the FNV-1a of exactly its snapshot bytes
-  (exec: address-free view; raw stack compared in-process by the probe).
+  suspended game fiber + generated tail-frame head, cpu, sched, exact, ram,
+  machine, fm, psg, evq, input, game) drives both the snapshot and the
+  12-partition digest; each section's digest is the FNV-1a of exactly its
+  snapshot bytes (exec: address-free view; raw stack compared in-process by
+  the probe). `exact` is the exact scheduler's state (`exact_sched.c`, games
+  with `GameSpec.exact_timing`; empty otherwise), digested into `sched`:
+  without it the probe forked X-Men 2 at the first replayed tick (bus, z80).
+  The same snapshot serves offline branch plans (`main.c --branch-plan`).
   `static_assert`s pin every raw image; `genesis_rb_selftest()` is the
   mutation test.
 - **Determinism probe** (`runner/rb_probe.c`, `GENESIS_RB_PROBE=period:depth`,
