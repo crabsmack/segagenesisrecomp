@@ -603,7 +603,32 @@ int gvdp_active_width(const GVDP *v)
  * `line` is an OUTPUT row: a raster line normally, a double-res row in
  * interlace mode 2, where sprite Y/height are in double-res units (Y origin
  * 256 instead of 128), cells are 8x16 and patterns 64 bytes. */
-static void sprite_render_line(GVDP *v, int line, int total, int offset)
+/* Sprite parsing for output row `line`, done one line ahead (Genesis Plus GX parse_satb_m5:
+ * at the start of the previous line, or of the frame's last line for row 0). From the
+ * internal attribute cache: a sprite beyond the per-line maximum (20 in H40, 16 in H32) on
+ * the row sets the overflow status bit. */
+void gvdp_sprite_parse(GVDP *v, int line)
+{
+    if (s_unlimited_sprites) return;
+    int h40 = MODE4_H40(v), im2 = MODE4_IM2(v);
+    int max_sprites = h40 ? 80 : 64, max_per_line = h40 ? 20 : 16;
+    int cell_h_shift = im2 ? 4 : 3;
+    int link = 0, count = 0;
+    for (int n = 0; n < max_sprites; n++) {
+        uint16_t c = (uint16_t)(link * 8);
+        int y = (sat_read_word(v, c) & (im2 ? 0x3FF : 0x1FF)) - (im2 ? 256 : 128);
+        int height = ((v->sat[(c + 2) & 0x3FF] & 3) + 1) << cell_h_shift;
+        if (line >= y && line < y + height) {
+            if (count == max_per_line) { v->sprite_overflow = 1; return; }
+            count++;
+        }
+        int next = v->sat[(c + 3) & 0x3FF] & 0x7F;
+        if (next == 0 || next >= max_sprites) return;
+        link = next;
+    }
+}
+
+static void sprite_render_line(GVDP *v, int line, int total, int offset, int shift_b)
 {
     /* `total` = output columns this row (incl. widescreen margins / pillarbox);
      * `offset` = output column that authentic screen column 0 maps to (centers
@@ -631,8 +656,24 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
     static uint8_t drawn_buf[GVDP_MAX_WIDTH + 2 * SPR_BORDER];
     uint8_t *drawn = drawn_buf + SPR_BORDER;
     memset(drawn_buf, 0, (size_t)total + 2 * SPR_BORDER);
+    /* The border columns keep earlier lines' sprite pixels (v->spr_edge), except where this
+     * line's plane-B pass wrote: with fine scroll s, x in [s-16, 0) and [width, width+s)
+     * (Genesis Plus GX render_bg_m5 draws its partial first column at buffer offset 16+s). */
+    if (shift_b) {
+        memset(v->spr_edge + 16 + shift_b, 0, (size_t)(16 - shift_b));
+        memset(v->spr_edge + 32, 0, (size_t)shift_b);
+    }
+    memcpy(drawn_buf, v->spr_edge, 32);
+    memcpy(drawn_buf + SPR_BORDER + total, v->spr_edge + 32, 32);
 
-    int link = 0, on_line = 0, pixels_budget = total;
+    /* As Genesis Plus GX render_obj_m5: sprites count toward the line's pixel limit (the
+     * screen width) even off screen; at the limit the last one is cut to whole cells and
+     * the line ends (no status bit: overflow is the 21st/17th sprite, set when the line is
+     * parsed, sprite_parse_line). Masking: an x==0 sprite after one with x!=0 on this line,
+     * or from the start of a line that follows one which hit the pixel limit. */
+    int link = 0, on_line = 0, pixelcount = 0, masked = 0;
+    int spr_ovr = v->spr_mask_carry;
+    v->spr_mask_carry = 0;
 
     for (int n = 0; n < max_sprites; n++) {
         /* Y, size and link from the internal cache, name/attributes and X
@@ -647,7 +688,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
         int next   = v->sat[(c + 3) & 0x3FF] & 0x7F;
 
         if (line >= y && line < y + height) {
-            if (++on_line > max_per_line && !s_unlimited_sprites) { v->sprite_overflow = 1; break; }
+            if (++on_line > max_per_line && !s_unlimited_sprites) break;
 
             uint16_t attr = vram_read_word(v, (uint16_t)(e + 4));
             /* 10-bit sprite X (was 0x1FF). The centered widescreen view needs
@@ -661,9 +702,9 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             int xword     = vram_read_word(v, (uint16_t)(e + 6)) & 0x3FF;
             int screen_x  = xword - 128 + offset;  /* +offset: center in the output canvas */
 
-            /* Sprite masking: an x==0 sprite after another on-line sprite
-             * masks the rest of the line. */
-            if (xword == 0 && on_line > 1) break;
+            /* Sprite masking (9-bit X as the reference parses it). */
+            if (xword & 0x1FF) spr_ovr = 1;
+            else if (spr_ovr) masked = 1;
 
             int tile = attr & 0x07FF;
             int pal  = (attr >> 13) & 0x3;
@@ -671,8 +712,13 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             int hf   = (attr & 0x0800) != 0;
             int vf   = (attr & 0x1000) != 0;
             int width = hsz * 8;
+            pixelcount += width;
+            int draw_w = width;                       /* cut to whole cells at the pixel limit */
+            if (pixelcount > total && !s_unlimited_sprites)
+                draw_w = (width - (pixelcount - total)) & ~7;
             /* partly on screen: off-screen pixels still collide (see drawn) */
-            int coll = screen_x + width > 0 && screen_x < total;
+            int coll = screen_x + width > 0 && screen_x < total && !masked;
+            if (!coll) draw_w = 0;
 
             int iy = vf ? (height - 1 - (line - y)) : (line - y);
             int celly = iy >> cell_h_shift, fy = iy & ((1 << cell_h_shift) - 1);
@@ -681,7 +727,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             /* Resolve sprite cell/row addresses once per eight output pixels.
              * VRAM is stable during this scanline call; no persistent cache or
              * invalidation/state migration is involved. */
-            for (int cell = 0; cell < hsz; ++cell) {
+            for (int cell = 0; cell < (draw_w >> 3); ++cell) {
                 int cellx = hf ? hsz - 1 - cell : cell;
                 int tileno = (tile + cellx * vsz + celly) & 0x07ff;
                 uint16_t pa = (uint16_t)(tileno * tile_bytes + fy * 4);
@@ -709,7 +755,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
                 }
             }
 #else
-            for (int lx = 0; lx < width; lx++) {
+            for (int lx = 0; lx < draw_w; lx++) {
                 int sx = screen_x + lx;
                 int off = sx < 0 || sx >= total;
                 if (off && !coll) continue;
@@ -737,13 +783,17 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             }
 
 #endif
-            pixels_budget -= width;
-            if (pixels_budget <= 0 && !s_unlimited_sprites) { v->sprite_overflow = 1; break; }
+            if (pixelcount >= total && !s_unlimited_sprites) { v->spr_mask_carry = 1; break; }
         }
 
         if (next == 0 || next >= max_sprites) break;   /* link 0, or past the table's end */
         link = next;
     }
+    memcpy(v->spr_edge, drawn_buf, 32);
+    memcpy(v->spr_edge + 32, drawn_buf + SPR_BORDER + total, 32);
+    /* the next line's sprites are parsed now (overflow is a parse-time flag) */
+    if (line + 1 < gvdp_output_height(v))
+        gvdp_sprite_parse(v, line + 1);
 }
 
 /* Plane geometry: tiles wide/high from reg[16] (00=32,01=64,11=128). */
@@ -907,7 +957,7 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
     int sh_mode = MODE4_SHI(v) != 0;
 
     /* Sprite layer for this output row (placed in centered output-column space). */
-    sprite_render_line(v, line, total, offset);
+    sprite_render_line(v, line, total, offset, hs_b & 0x0F);
     if (s_host_sprites) {
         GVDPSpriteLayer layer = { line, total, offset, s_spr_idx, s_spr_op, s_spr_hi };
         s_host_sprites(s_host_sprites_user, v, &layer);

@@ -255,6 +255,28 @@ void cosim_checkpoint(void);        /* hash + park; advances g_cosim_next_cp    
  * data-dependent cost; XSR requests an interrupt check after an SR write. */
 extern uint32_t g_xclk, g_xstart, g_xend, g_xpc;
 extern uint32_t g_xrts;    /* where the last RTS returned (68000 stack), exact mode */
+/* Returns nobody waits for. A call site waits for its own return address
+ * (XCALL_BEGIN/XCALL_END around the call) and consumes a matching RTS
+ * (XRTS_TAKEN). An RTS that lands where no enclosing site waits, e.g. a
+ * threaded-code handler returning into its dispatch loop (`pea loop(pc); jmp
+ * handler`), is where the 68000 continues: the dispatcher runs it next
+ * (x68k_resume, called by the generated tail-call drain). */
+#define XAWAIT_MAX 4096
+extern uint32_t g_xawait[XAWAIT_MAX];
+extern int      g_xawait_n;
+extern int      g_xrts_new;  /* an RTS set g_xrts and no call site has taken it yet */
+#define XCALL_BEGIN(r) do { if (g_xawait_n < XAWAIT_MAX) g_xawait[g_xawait_n] = (r); g_xawait_n++; } while (0)
+#define XCALL_END() (g_xawait_n--)
+#define XRTS_TAKEN() (g_xrts_new = 0)
+int x68k_resume(uint32_t *addr);  /* 1: run *addr next (a fresh RTS nobody waits for) */
+/* After an RTE popped SR and PC: inside an interrupt handler it returns to the interrupted
+ * code (g_rte_pending); outside one (a context switch: push PC and SR, RTE) it is a jump to
+ * the popped PC, which the dispatcher runs next like an RTS nobody waits for. */
+void x68k_rte(void);
+/* Exact mode, a dispatch miss in ROM code (a task the game resumes where an interrupt parked
+ * it, mid-function): run it on the exact interpreter until an address generated code can be
+ * entered at (has_entry), then tail-dispatch that. 1 = handled. */
+int recomp_exact_rom_resume(uint32_t addr, int (*has_entry)(uint32_t));
 extern uint32_t g_xa7min;  /* lowest A7 at any instruction boundary (sync CRC dead stack) */
 extern uint64_t g_xinsn;   /* instructions started (logical positions: interrupt since) */
 extern int      g_xtrace;
@@ -266,7 +288,12 @@ void x68k_divide_by_zero(uint32_t next_pc);
 /* XI's two halves: the boundary (slice end / interrupt) and the start of the instruction with
  * its cost. The interpreter (RAM-resident code) decodes between them: an interrupt taken at
  * the boundary may patch the very instruction it interrupted, which hardware refetches. */
-#define XI_BOUNDARY(pc) do { if (g_xclk >= g_xend) x68k_slice(pc); } while (0)
+#define XI_BOUNDARY(pc) do { if (g_xclk >= g_xend) { x68k_slice(pc); \
+    if (g_xabort) { g_xabort = 0; return; } } } while (0)
+/* Set by the scheduler when an interrupt handler's RTE went to another PC than the
+ * interrupted one (a task switch): the interrupted code is abandoned, so the generated
+ * function returns at its boundary and the new PC (g_xrts, fresh) is routed like a return. */
+extern int g_xabort;
 #define XI_CHARGE(pc, c) do { g_xpc = (pc); \
     g_xstart = g_xclk; if (g_xtrace) x68k_trace(pc); g_xclk += (c); g_xinsn++; \
     if (g_cpu.A[7] < g_xa7min) g_xa7min = g_cpu.A[7]; } while (0)

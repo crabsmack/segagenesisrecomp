@@ -72,6 +72,16 @@ typedef struct GVDP {
      * from VRAM. Written by every VRAM write that lands in the current table
      * (gvdp_sat_byte); not refreshed when register 5 moves the table. */
     uint8_t  sat[0x400];
+    /* Sprite-pixel markers in the 32 columns either side of the screen
+     * ([0,32): x = -32..-1; [32,64): x = width..width+31). They persist from
+     * line to line where the background pass doesn't rewrite them, as in the
+     * reference's bordered sprite line buffer, and sprites partly on screen
+     * collide with them (sprite_render_line). */
+    uint8_t  spr_edge[64];
+    /* Sprite masking carried into the next line: the line hit the sprite pixel
+     * limit, so an x==0 sprite masks from the start of the next line. */
+    uint8_t  spr_mask_carry;
+    uint8_t  spr_reserved[7];
     uint16_t vsram[GVDP_VSRAM_ENTRIES];
 
     /* Register file ($00..$17). */
@@ -177,6 +187,9 @@ void gvdp_store_vram_word(GVDP *v, uint16_t addr, uint16_t value);
  * sprite attribute cache when it lands in the current table. Every VRAM write
  * path calls it (word stores do it themselves). */
 void gvdp_sat_byte(GVDP *v, uint16_t addr, uint8_t b);
+/* Parse the sprites of output row `line` one line ahead (sets the overflow
+ * status bit); the exact scheduler parses row 0 at the frame's last line. */
+void gvdp_sprite_parse(GVDP *v, int line);
 void gvdp_store_cram(GVDP *v, uint16_t addr, uint16_t value);
 void gvdp_store_vsram(GVDP *v, uint16_t addr, uint16_t value);
 

@@ -444,6 +444,23 @@ static int s_in_vblank_service = 0;
 #include "game_spec.h"      /* g_game_spec.call_entry_point / vblank / hblank / periodic */
 #include "exact_sched.h"    /* g_exact, xbus_* (cycle-exact mode) */
 
+int recomp_exact_rom_resume(uint32_t addr, int (*has_entry)(uint32_t))
+{
+    addr &= 0xFFFFFFu;
+    if (!g_exact || addr >= 0x400000u)
+        return 0;
+    uint32_t next = 0;
+    M68kiStatus st = m68k_interp_run_exact_until(addr, has_entry, &next);
+    if (st != M68KI_OK) {
+        fprintf(stderr, "[dispatch][ROM] unrunnable ROM code from $%06X status=%d bad_pc=$%06X bad_op=$%04X\n",
+                addr, (int)st, g_m68ki_bad_pc, g_m68ki_bad_op);
+        return 0;
+    }
+    if (next)
+        recomp_tail_call(next);
+    return 1;
+}
+
 
 void glue_log_frame_state(uint64_t frame);  /* defined below */
 

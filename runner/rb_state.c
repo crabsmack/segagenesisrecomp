@@ -30,9 +30,9 @@ _Static_assert(sizeof(AudioEvent) == 8, "AudioEvent changed: review audio_event_
 _Static_assert(0x10000 == 0x10000, "work RAM size changed");
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFu
 /* 64-bit layouts (the host pointers inside are scrubbed by machine_rb_save). */
-_Static_assert(sizeof(GVDP) == 66848, "GVDP changed: review machine_rb_save (pointers) and rb_state");
+_Static_assert(sizeof(GVDP) == 66920, "GVDP changed: review machine_rb_save (pointers) and rb_state");
 _Static_assert(sizeof(GenesisBus) == 24664, "GenesisBus changed: review machine_rb_save and rb_state");
-_Static_assert(sizeof(GenesisMachine) == 91600, "GenesisMachine changed: review machine_rb_save and rb_state");
+_Static_assert(sizeof(GenesisMachine) == 91672, "GenesisMachine changed: review machine_rb_save and rb_state");
 #endif
 
 /* ---- sections ---------------------------------------------------------------- */

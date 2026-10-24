@@ -218,6 +218,10 @@ typedef struct GameSpec {
      * when the hook ran the function's body itself (a verification harness): the
      * generated wrapper then returns at once. NULL = 0. */
     int           (*on_entry)(uint32_t addr);
+    /* Which reference release exact mode reproduces where their timings differ:
+     * 0 or 24 = BizHawk 2.4's Genesis Plus GX (the default), 291 = BizHawk 2.9.1's
+     * (blanked-display DMA rates 166/204, not 167/205). */
+    int             exact_reference;
 
     /* Opt-in main-program CPU headroom, queried at each scheduler slice.
      * NULL / <=1 = exact native timing. IRQ, DMA, raster and sound clocks

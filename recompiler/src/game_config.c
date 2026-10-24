@@ -88,6 +88,12 @@ static void append_extra_seed(GameConfig *cfg, uint32_t addr) {
     cfg->extra_seeds[cfg->extra_seed_count++] = addr;
 }
 
+static void append_noreturn(GameConfig *cfg, uint32_t addr) {
+    cfg->noreturn = grow_to_fit(cfg->noreturn, &cfg->noreturn_cap, cfg->noreturn_count,
+                                sizeof(uint32_t));
+    cfg->noreturn[cfg->noreturn_count++] = addr & 0xFFFFFFu;
+}
+
 static void append_blacklist(GameConfig *cfg, uint32_t addr) {
     cfg->blacklist = grow_to_fit(cfg->blacklist,
                                  &cfg->blacklist_cap,
@@ -293,6 +299,14 @@ static bool merge_toml(GameConfig *cfg, toml_table_t *root, const char *src_path
                 if (d.ok) append_blacklist(cfg, (uint32_t)d.u.i);
             }
         }
+        toml_array_t *nr = toml_array_in(funcs, "noreturn");
+        if (nr) {
+            int n = toml_array_nelem(nr);
+            for (int i = 0; i < n; i++) {
+                toml_datum_t d = toml_int_at(nr, i);
+                if (d.ok) append_noreturn(cfg, (uint32_t)d.u.i);
+            }
+        }
     }
 
     /* [[jump_table]] */
@@ -342,6 +356,7 @@ void game_config_free(GameConfig *cfg) {
     free(cfg->function_pointer_helpers);
     free(cfg->extra_seeds);
     free(cfg->blacklist);
+    free(cfg->noreturn);
     free(cfg->protected_ranges);
     free(cfg->code_addrs);
     free(cfg->runtime_exec);
@@ -569,6 +584,8 @@ bool game_config_load(GameConfig *cfg, const char *path) {
 
     if (cfg->blacklist_count > 0)
         printf("[GameConfig] %d blacklisted addresses loaded\n", cfg->blacklist_count);
+    if (cfg->noreturn_count > 0)
+        printf("[GameConfig] %d noreturn callees loaded\n", cfg->noreturn_count);
 
     return ok;
 }
@@ -576,6 +593,14 @@ bool game_config_load(GameConfig *cfg, const char *path) {
 bool game_config_is_blacklisted(const GameConfig *cfg, uint32_t addr) {
     for (int i = 0; i < cfg->blacklist_count; i++)
         if (cfg->blacklist[i] == addr)
+            return true;
+    return false;
+}
+
+bool game_config_is_noreturn(const GameConfig *cfg, uint32_t addr) {
+    if (!cfg) return false;
+    for (int i = 0; i < cfg->noreturn_count; i++)
+        if (cfg->noreturn[i] == (addr & 0xFFFFFFu))
             return true;
     return false;
 }

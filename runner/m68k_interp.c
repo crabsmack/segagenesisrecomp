@@ -1606,19 +1606,31 @@ M68kiStatus m68k_interp_run_handler(uint32_t entry_pc) {
  *   - RTE pops SR and PC (the frame take_interrupt pushed), XSR, g_rte_pending;
  *   - SR writes request the interrupt check (XSR; XSRP first when untimed).
  * The default runner's bookkeeping (g_cycle_accumulator, glue_check_vblank, game hooks)
- * does not run: exact time is g_xclk alone. */
-static M68kiStatus run_ram_handler_exact(uint32_t entry_pc, uint32_t *out_exit_pc)
+ * does not run: exact time is g_xclk alone.
+ * With is_entry (ROM code no generated function can be entered at, e.g. a task the game
+ * resumes where an interrupt parked it): stop before any later instruction generated code
+ * can be entered at, leaving it in *out_next for the dispatcher. */
+static M68kiStatus run_exact(uint32_t entry_pc, uint32_t *out_exit_pc,
+                             int (*is_entry)(uint32_t), uint32_t *out_next)
 {
     g_cpu.PC = entry_pc & 0xFFFFFFu;
     g_m68ki_insn_count = 0;
     g_m68ki_discover_count = 0;
     if (out_exit_pc) *out_exit_pc = 0;
+    if (out_next) *out_next = 0;
 
     int depth = 0;
     for (;;) {
         uint32_t pc = g_cpu.PC & 0xFFFFFFu;
         if (!pc_fetchable(pc)) { g_m68ki_bad_pc = pc; return M68KI_HALT_BADADDR; }
-        if (X_TIMED) XI_BOUNDARY(pc);
+        if (is_entry && pc != (entry_pc & 0xFFFFFFu) && is_entry(pc)) {
+            *out_next = pc;
+            return M68KI_OK;
+        }
+        if (X_TIMED && g_xclk >= g_xend) {    /* XI_BOUNDARY */
+            x68k_slice(pc);
+            if (g_xabort) { g_xabort = 0; return M68KI_OK; }   /* a task switch abandoned this code */
+        }
 
         M68KInstr ins;
         if (!m68k_decode(busview(), pc, &ins)) {
@@ -1632,7 +1644,7 @@ static M68kiStatus run_ram_handler_exact(uint32_t entry_pc, uint32_t *out_exit_p
             g_cpu.SR = (uint16_t)m68k_read16(g_cpu.A[7]); g_cpu.A[7] += 2;
             g_cpu.PC = m68k_read32(g_cpu.A[7]);            g_cpu.A[7] += 4;
             XSR();
-            g_rte_pending = 1;
+            x68k_rte();          /* an interrupt return, or a jump outside a handler */
             return M68KI_OK;
         }
         if (depth == 0 && (ins.mnemonic == MN_RTS || ins.mnemonic == MN_RTR)) {
@@ -1641,6 +1653,7 @@ static M68kiStatus run_ram_handler_exact(uint32_t entry_pc, uint32_t *out_exit_p
                 g_cpu.SR = (uint16_t)((g_cpu.SR & 0xFF00u) | (ccr & 0xFFu));
             }
             g_xrts = pop32() & 0xFFFFFFu;
+            g_xrts_new = 1;
             g_cpu.PC = g_xrts;
             if (out_exit_pc) *out_exit_pc = g_xrts;
             return M68KI_OK;
@@ -1665,12 +1678,24 @@ static M68kiStatus run_ram_handler_exact(uint32_t entry_pc, uint32_t *out_exit_p
     }
 }
 
+/* Exact mode: run ROM code from `pc`, where no generated function can be entered (a task the
+ * game resumes mid-function), until the next instruction one can: *out_next (0 when the code
+ * returned or switched away first). */
+M68kiStatus m68k_interp_run_exact_until(uint32_t pc, int (*is_entry)(uint32_t), uint32_t *out_next)
+{
+    int saved = s_xmode;
+    s_xmode = g_game_spec.stepped ? 2 : 1;
+    M68kiStatus st = run_exact(pc, NULL, is_entry, out_next);
+    s_xmode = saved;
+    return st;
+}
+
 M68kiStatus m68k_interp_run_ram_handler(uint32_t entry_pc, uint32_t *out_exit_pc)
 {
     if (g_exact) {
         int saved = s_xmode;
         s_xmode = g_game_spec.stepped ? 2 : 1;
-        M68kiStatus st = run_ram_handler_exact(entry_pc, out_exit_pc);
+        M68kiStatus st = run_exact(entry_pc, out_exit_pc, NULL, NULL);
         s_xmode = saved;
         return st;
     }

@@ -220,6 +220,14 @@ typedef struct {
     uint32_t       *blacklist;
     int            blacklist_count;
     int            blacklist_cap;
+    /* [functions].noreturn: callees that never return to the instruction after
+     * the call (a threaded-code VM that pops its return address as the script
+     * pointer: the bytes after the call are its script, not code). Discovery
+     * ends the path at a direct call to one, and the call site returns after
+     * it instead of falling through. */
+    uint32_t       *noreturn;
+    int            noreturn_count;
+    int            noreturn_cap;
     /* Disasm "is this address code?" oracle (instruction-start set), loaded
      * from game.toml `code_addrs_file` (one hex addr per line, e.g. produced
      * by tests/tools/gen_code_addrs.py). When non-empty, boundary-split /
@@ -305,6 +313,9 @@ bool game_config_is_protected(const GameConfig *cfg, uint32_t addr);
 
 /* Returns true if addr is in the blacklist */
 bool game_config_is_blacklisted(const GameConfig *cfg, uint32_t addr);
+
+/* Returns true if a call to addr never returns to the instruction after it */
+bool game_config_is_noreturn(const GameConfig *cfg, uint32_t addr);
 
 /* Returns true if addr is a known instruction-start per the disasm code-addr
  * oracle. If no code_addrs_file was loaded (code_addr_count == 0) this returns

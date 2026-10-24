@@ -30,6 +30,37 @@ uint32_t g_xrts   = 0;     /* 68000 return target of the last RTS               
 uint32_t g_xa7min = 0xFFFFFFFFu; /* lowest A7 at any instruction boundary       */
 int      g_xtrace = 0;
 
+/* Call sites waiting for their return address (genesis_runtime.h). */
+uint32_t g_xawait[XAWAIT_MAX];
+int      g_xawait_n = 0;
+int      g_xrts_new = 0;
+
+int x68k_resume(uint32_t *addr)
+{
+    if (!g_exact || !g_xrts_new)
+        return 0;
+    int n = g_xawait_n < XAWAIT_MAX ? g_xawait_n : XAWAIT_MAX;
+    for (int i = n; i-- > 0;)
+        if (g_xawait[i] == g_xrts)
+            return 0;              /* an enclosing call site takes it: unwind to it */
+    g_xrts_new = 0;
+    *addr = g_xrts;
+    return 1;
+}
+
+static int s_irq_depth;   /* interrupt handlers running (take_interrupt) */
+int g_xabort;             /* genesis_runtime.h */
+
+void x68k_rte(void)
+{
+    if (!g_exact || s_irq_depth > 0) {
+        g_rte_pending = 1;
+        return;
+    }
+    g_xrts = g_cpu.PC & 0xFFFFFFu;
+    g_xrts_new = 1;
+}
+
 /* Verification hooks (genesis_runtime.h). */
 int  (*g_xhw_hook)(uint32_t addr, int size, int kind, uint16_t v, uint16_t *out);
 void (*g_xinsn_hook)(uint32_t pc);
@@ -218,7 +249,9 @@ static void take_interrupt(uint32_t pc, unsigned level)
     int saved_split = g_split_sp_popped;   /* isolate the interrupted split chain */
     g_split_sp_popped = 0;
     pos_irq_enter(level);
+    s_irq_depth++;
     recomp_call_addr(vec);
+    s_irq_depth--;
     pos_irq_leave();
     g_split_sp_popped = saved_split;
     if (!g_rte_pending) {
@@ -227,9 +260,15 @@ static void take_interrupt(uint32_t pc, unsigned level)
         exit(4);
     }
     if ((g_cpu.PC & 0xFFFFFFu) != (pc & 0xFFFFFFu)) {
-        fprintf(stderr, "[exact] RTE to $%06X, interrupted at $%06X: unsupported\n",
-                g_cpu.PC & 0xFFFFFFu, pc & 0xFFFFFFu);
-        exit(4);
+        /* A task switch: the handler parked the interrupted code (its state is the game's to
+         * resume later) and returned into another task. The 68000 continues at the new PC:
+         * abandon the interrupted generated code at its boundary (g_xabort) and route the
+         * PC like a return nobody waits for, or one an enclosing call site does. */
+        g_xrts = g_cpu.PC & 0xFFFFFFu;
+        g_xrts_new = 1;
+        g_xabort = 1;
+        g_rte_pending = saved_rte;
+        return;
     }
     g_rte_pending = saved_rte;
 }
@@ -253,6 +292,7 @@ void x68k_slice(uint32_t pc)
             s_check_now = 0;
             if (s_int_level > ((g_cpu.SR >> 8) & 7u)) {
                 take_interrupt(pc, s_int_level);
+                if (g_xabort) { g_xend = 0; return; }   /* task switch: check at the new code */
                 continue;
             }
         }
@@ -261,6 +301,7 @@ void x68k_slice(uint32_t pc)
             glue_exact_park();            /* returns at the start of a new slice */
             if (s_int_level > ((g_cpu.SR >> 8) & 7u))
                 take_interrupt(pc, s_int_level);
+            if (g_xabort) { g_xend = 0; return; }
             continue;
         }
         break;
@@ -449,7 +490,10 @@ static void dma_finished(void)
 
 static void dma_update_at(uint32_t now, int from_cpu)
 {
-    static const uint32_t rate_tab[2][2] = { { 16, 18 }, { 167, 205 } };
+    /* Transfers per line {active, blanked} x {H32, H40}. The reference's own table: BizHawk 2.4's
+     * Genesis Plus GX has 167/205 blanked, the one in BizHawk 2.9.1 166/204
+     * (GameSpec.exact_reference). */
+    static const uint32_t rate_tab[2][2][2] = { { { 16, 18 }, { 167, 205 } }, { { 16, 18 }, { 166, 204 } } };
     if (s_stepped) {
         /* No clock: the whole transfer happens at its start. Status reads are
          * replayed, so the busy flag the game polls comes from the reference. */
@@ -468,7 +512,7 @@ static void dma_update_at(uint32_t now, int from_cpu)
         return;
     }
     int blank = (s_status & 8) || !(REG(1) & 0x40);
-    uint32_t rate = rate_tab[blank][REG(12) & 1] >> (s_dma_type & 1);
+    uint32_t rate = rate_tab[g_game_spec.exact_reference >= 291][blank][REG(12) & 1] >> (s_dma_type & 1);
     int32_t dma_cycles;
     if (s_status & 8) dma_cycles = (int32_t)(LINES * MPL) - (int32_t)now;
     else              dma_cycles = (int32_t)(s_mline + MPL) - (int32_t)now;
@@ -1574,6 +1618,7 @@ void exact_reset(void)
 {
     g_xclk = g_xstart = 40u * MCLK_68K;   /* reset exception */
     g_xend = 0;
+    g_xawait_n = 0; g_xrts_new = 0;
     s_end = 0;
     s_mline = 0;
     s_int_level = 0; s_irq_latency = 0;
@@ -1648,6 +1693,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
     s_status &= 0xFEE5;
     s_status |= 0x0200;
     if (s_dma_length) dma_update_at(0, 0);
+    if (REG(1) & 0x40) gvdp_sprite_parse(v, 0);   /* row 0's sprites, parsed during line 261 */
 
     run_line_end(MPL);
     s_mline += MPL;
