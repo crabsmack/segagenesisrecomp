@@ -158,7 +158,7 @@ static void write_player(FILE *f, int player)
     const PlayerInput *pi = &g_input_map.p[player];
     fprintf(f, "[input.p%d]\n", player + 1);
     fprintf(f, "device = %d        ; 0 none, 1 keyboard, 2 gamepad, 3 both\n", pi->device);
-    fprintf(f, "pad_type = %d      ; 0 = 3-button, 1 = 6-button\n", pi->pad_type);
+    fprintf(f, "pad_type = %d      ; 0 = 3-button, 1 = 6-button, 2 = none (unplugged)\n", pi->pad_type);
     fprintf(f, "deadzone = %d\n", pi->deadzone_pct);
     for (int b = 0; b < GB_COUNT; b++)
         fprintf(f, "key.%s = %d\n", input_button_name((GenesisButton)b), pi->key[b]);

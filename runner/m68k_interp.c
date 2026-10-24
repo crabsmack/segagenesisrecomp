@@ -15,6 +15,9 @@
 #include "m68k_interp.h"
 #include "m68k_decoder.h"   /* recompiler/src — added to the runner include path */
 #include "rom_parser.h"     /* GenesisRom, rom_read* (decoder's fetch source)    */
+#include "m68k_cycles.h"    /* the generator's timing model (one source)          */
+#include "exact_sched.h"    /* g_exact                                            */
+#include "game_spec.h"      /* g_game_spec.stepped (exact mode, untimed code)     */
 #ifdef GENESIS_COSIM
 #include "game_cycles.h"    /* game_insn_cost — clown-measured baked costs        */
 #endif
@@ -28,6 +31,14 @@ uint32_t g_m68ki_bad_pc = 0;
 uint16_t g_m68ki_bad_op = 0;
 uint64_t g_m68ki_insn_count = 0;
 uint64_t g_m68ki_insn_total = 0;   /* every instruction any capsule retired, whole session */
+
+/* Exact mode (game.toml exact_timing) inside the RAM-handler capsule: the generated code's
+ * contract (code_generator.c s_exact / s_timed), instruction for instruction. 0: the default
+ * runner's contract; 1: exact and timed (XI/XC); 2: exact and untimed (the stepped runner:
+ * XSRP/XSR only). Set only while the capsule runs; an interrupt taken inside it can nest
+ * another capsule, which saves and restores it. */
+static int s_xmode;
+#define X_TIMED (s_xmode == 1)
 
 /* Coverage discovery (see header): distinct call/jump targets this run. */
 uint32_t g_m68ki_discover[M68KI_MAX_DISCOVER];
@@ -63,7 +74,7 @@ static int s_illegal_ea = 0;
 static uint8_t busview_fetch8(uint32_t addr, void *user) {
     (void)user;
     addr &= 0xFFFFFFu;
-    if (addr >= 0xFF0000u) return g_ram[addr & 0xFFFFu];
+    if (addr >= 0xE00000u) return g_ram[addr & 0xFFFFu];
     if (addr < ROM_SIZE)   return g_rom[addr];
     return 0xFFu;
 }
@@ -82,7 +93,7 @@ static const GenesisRom *busview(void) {
 /* A PC is fetchable when it points at ROM or work RAM. */
 static int pc_fetchable(uint32_t pc) {
     pc &= 0xFFFFFFu;
-    return pc < ROM_SIZE || pc >= 0xFF0000u;
+    return pc < ROM_SIZE || pc >= 0xE00000u;
 }
 
 /* =========================================================================
@@ -456,6 +467,46 @@ static void do_div(int dr, uint32_t src16, int is_signed) {
     }
     /* overflow */
     g_cpu.SR |= SR_V; g_cpu.SR |= SR_N; g_cpu.SR &= ~SR_Z;   /* Dn left unchanged */
+}
+
+/* DIVU/DIVS in exact mode — port of code_generator.c's s_exact emission (the reference's
+ * Musashi semantics, which differ from do_div's on overflow: Z is left alone; DIVS
+ * $80000000 / -1 gives 0 with Z set), with its time (charged before the overflow test). */
+static void do_div_exact(const M68KInstr *ins, uint32_t src16, int is_signed) {
+    int dr = ins->reg;
+    uint32_t next = ins->addr + ins->byte_length;
+    if (!is_signed) {
+        uint32_t dv = (uint16_t)src16, dest = g_cpu.D[dr];
+        if (dv == 0u) { g_cpu.SR &= ~SR_C; x68k_divide_by_zero(next); return; }
+        uint32_t quo = dest / dv, rem = dest % dv;
+        if (quo < 0x10000u) {
+            if (X_TIMED) XC(x68k_divu_mclk(dest, dv));
+            g_cpu.D[dr] = (quo & 0xFFFFu) | ((rem & 0xFFFFu) << 16);
+            g_cpu.SR &= ~(SR_N | SR_Z | SR_V | SR_C);
+            if (quo & 0x8000u)          g_cpu.SR |= SR_N;
+            if ((quo & 0xFFFFu) == 0u)  g_cpu.SR |= SR_Z;
+        } else {
+            if (X_TIMED) XC(70);
+            g_cpu.SR |= SR_V | SR_N; g_cpu.SR &= ~SR_C;
+        }
+        return;
+    }
+    int32_t dv = (int16_t)src16, dest = (int32_t)g_cpu.D[dr];
+    if (dv == 0) { g_cpu.SR &= ~SR_C; x68k_divide_by_zero(next); return; }
+    if (X_TIMED) XC(x68k_divs_mclk(dest, (int16_t)dv));
+    if ((uint32_t)dest == 0x80000000u && dv == -1) {
+        g_cpu.D[dr] = 0u; g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0Fu) | SR_Z);
+        return;
+    }
+    int32_t quo = dest / dv, rem = dest % dv;
+    if (quo == (int16_t)quo) {
+        g_cpu.D[dr] = ((uint32_t)quo & 0xFFFFu) | (((uint32_t)rem & 0xFFFFu) << 16);
+        g_cpu.SR &= ~(SR_N | SR_Z | SR_V | SR_C);
+        if (quo & 0x8000)           g_cpu.SR |= SR_N;
+        if ((quo & 0xFFFF) == 0)    g_cpu.SR |= SR_Z;
+    } else {
+        g_cpu.SR |= SR_V | SR_N; g_cpu.SR &= ~SR_C;
+    }
 }
 
 /* ADDX/SUBX — port of code_generator.c (Dn,Dn and -(Ay),-(Ax) forms).
@@ -873,6 +924,7 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
         return M68KI_OK;
     case MN_Bcc:
         if (eval_cond(cc)) *next_pc = ins->target_addr;
+        else if (X_TIMED) XC(ins->byte_length == 2 ? -14 : 14);   /* not taken: .S 8, .W 12 */
         return M68KI_OK;
     case MN_BSR:
         discover(ins->target_addr);
@@ -884,7 +936,8 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
         uint32_t dn = (g_cpu.D[ins->reg] & 0xFFFFu);
         dn = (dn - 1) & 0xFFFFu;
         store_dn(ins->reg, dn, M68K_SIZE_W);
-        if ((int16_t)dn != -1) *next_pc = ins->target_addr;
+        if ((int16_t)dn != -1) { *next_pc = ins->target_addr; if (X_TIMED) XC(-14); }  /* loop: 10 */
+        else if (X_TIMED) XC(14);                                                     /* expired: 14 */
         return M68KI_OK;
     }
     case MN_JMP:
@@ -940,6 +993,10 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
             return M68KI_OK;
         }
         int reg_count = (ins->src_ea >= 0);
+        if (X_TIMED && reg_count)                        /* count register: 2 per bit, mod 64 */
+            XC(14u * (g_cpu.D[ins->src_ea] & 63u));
+        else if (X_TIMED && ((ins->words[0] >> 5) & 1))
+            XC(14u * (g_cpu.D[(ins->words[0] >> 9) & 7] & 63u));
         if (do_shift(ins->mnemonic, ins->reg, sz, reg_count, ins->src_ea, (int)(ins->imm32 & 63u)) != 0) {
             g_m68ki_bad_pc = ins->addr; g_m68ki_bad_op = ins->words[0];
             return M68KI_HALT_UNIMPL;
@@ -1005,22 +1062,28 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
     /* ---- MUL / DIV (.W source, .L Dn result) ---- */
     case MN_MULU: {
         uint32_t s = read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xFFFFu;
+        if (X_TIMED) XC(x68k_mulu_mclk((uint16_t)s));
         g_cpu.D[ins->reg] = (uint32_t)(uint16_t)g_cpu.D[ins->reg] * s;
         flags_logic(g_cpu.D[ins->reg], M68K_SIZE_L);
         return M68KI_OK;
     }
     case MN_MULS: {
         int32_t s = (int32_t)(int16_t)(read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xFFFFu);
+        if (X_TIMED) XC(x68k_muls_mclk((int16_t)s));
         g_cpu.D[ins->reg] = (uint32_t)((int32_t)(int16_t)g_cpu.D[ins->reg] * s);
         flags_logic(g_cpu.D[ins->reg], M68K_SIZE_L);
         return M68KI_OK;
     }
-    case MN_DIVU:
-        do_div(ins->reg, read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xFFFFu, 0);
+    case MN_DIVU: {
+        uint32_t s = read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xFFFFu;
+        if (s_xmode) do_div_exact(ins, s, 0); else do_div(ins->reg, s, 0);
         return M68KI_OK;
-    case MN_DIVS:
-        do_div(ins->reg, read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xFFFFu, 1);
+    }
+    case MN_DIVS: {
+        uint32_t s = read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xFFFFu;
+        if (s_xmode) do_div_exact(ins, s, 1); else do_div(ins->reg, s, 1);
         return M68KI_OK;
+    }
 
     /* ---- MOVEM ---- */
     case MN_MOVEM:
@@ -1046,14 +1109,21 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
     /* ---- Scc ---- */
     case MN_Scc: {
         uint8_t val = eval_cond(cc) ? 0xFFu : 0x00u;
+        if (X_TIMED && val && m68k_ea_is_reg(ins->src_ea) && cc > 1) XC(14);   /* Scc Dn true: 6 */
         write_ea(ins, ins->src_ea, M68K_SIZE_B, &er, val);
         return M68KI_OK;
     }
 
     /* ---- MOVE to/from SR / CCR / USP ---- */
     case MN_MOVE_SR:
-        if (!ins->dst_is_ea) g_cpu.SR = (uint16_t)(read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xA71Fu);
-        else                 write_ea(ins, ins->src_ea, M68K_SIZE_W, &er, g_cpu.SR);
+        if (!ins->dst_is_ea) {
+            uint16_t v = (uint16_t)(read_ea(ins, ins->src_ea, M68K_SIZE_W, &er) & 0xA71Fu);
+            if (s_xmode == 2) XSRP();
+            g_cpu.SR = v;
+            if (s_xmode) XSR();
+        } else {
+            write_ea(ins, ins->src_ea, M68K_SIZE_W, &er, g_cpu.SR);
+        }
         return M68KI_OK;
     case MN_MOVE_CCR:        /* CCR is 5 bits (0x1F) — clown masks; matches HW */
         if (!ins->dst_is_ea)
@@ -1077,11 +1147,17 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
 
     /* ---- immediate to SR / CCR (then mask to valid SR bits, like HW) ---- */
     case MN_ORI_TO_CCR:  g_cpu.SR |= (uint16_t)(ins->imm32 & 0xFFu);              g_cpu.SR &= 0xA71Fu; return M68KI_OK;
-    case MN_ORI_TO_SR:   g_cpu.SR |= (uint16_t)(ins->imm32 & 0xFFFFu);            g_cpu.SR &= 0xA71Fu; return M68KI_OK;
+    case MN_ORI_TO_SR:   if (s_xmode == 2) XSRP();
+                         g_cpu.SR |= (uint16_t)(ins->imm32 & 0xFFFFu);            g_cpu.SR &= 0xA71Fu;
+                         if (s_xmode) XSR();                                       return M68KI_OK;
     case MN_ANDI_TO_CCR: g_cpu.SR &= (uint16_t)(0xFF00u | (ins->imm32 & 0xFFu));  g_cpu.SR &= 0xA71Fu; return M68KI_OK;
-    case MN_ANDI_TO_SR:  g_cpu.SR &= (uint16_t)(ins->imm32 & 0xFFFFu);            g_cpu.SR &= 0xA71Fu; return M68KI_OK;
+    case MN_ANDI_TO_SR:  if (s_xmode == 2) XSRP();
+                         g_cpu.SR &= (uint16_t)(ins->imm32 & 0xFFFFu);            g_cpu.SR &= 0xA71Fu;
+                         if (s_xmode) XSR();                                       return M68KI_OK;
     case MN_EORI_TO_CCR: g_cpu.SR ^= (uint16_t)(ins->imm32 & 0xFFu);              g_cpu.SR &= 0xA71Fu; return M68KI_OK;
-    case MN_EORI_TO_SR:  g_cpu.SR ^= (uint16_t)(ins->imm32 & 0xFFFFu);            g_cpu.SR &= 0xA71Fu; return M68KI_OK;
+    case MN_EORI_TO_SR:  if (s_xmode == 2) XSRP();
+                         g_cpu.SR ^= (uint16_t)(ins->imm32 & 0xFFFFu);            g_cpu.SR &= 0xA71Fu;
+                         if (s_xmode) XSR();                                       return M68KI_OK;
 
     default:
         g_m68ki_bad_pc = ins->addr;
@@ -1519,8 +1595,85 @@ M68kiStatus m68k_interp_run_handler(uint32_t entry_pc) {
  * Cycle accounting runs per instruction (interp_account_cycles), the same
  * tail the generated code emits.
  * ------------------------------------------------------------------------- */
+/* Exact mode: the generated code's contract (code_generator.c s_exact), so RAM code is one
+ * more caller and callee among the generated functions:
+ *   - every instruction is a boundary: XI_BOUNDARY (slice end, interrupt), then the decode
+ *     (an interrupt handler may have patched this very instruction; hardware refetches it),
+ *     then XI_CHARGE with the generator's exact cost (m68k_cycles_exact), and inside
+ *     exec_one the same data-dependent XC deltas the generated code charges;
+ *   - RTS/RTR at depth 0 pop like hardware into g_xrts: the generated caller compares it with
+ *     its own return address and unwinds when the code returned further out;
+ *   - RTE pops SR and PC (the frame take_interrupt pushed), XSR, g_rte_pending;
+ *   - SR writes request the interrupt check (XSR; XSRP first when untimed).
+ * The default runner's bookkeeping (g_cycle_accumulator, glue_check_vblank, game hooks)
+ * does not run: exact time is g_xclk alone. */
+static M68kiStatus run_ram_handler_exact(uint32_t entry_pc, uint32_t *out_exit_pc)
+{
+    g_cpu.PC = entry_pc & 0xFFFFFFu;
+    g_m68ki_insn_count = 0;
+    g_m68ki_discover_count = 0;
+    if (out_exit_pc) *out_exit_pc = 0;
+
+    int depth = 0;
+    for (;;) {
+        uint32_t pc = g_cpu.PC & 0xFFFFFFu;
+        if (!pc_fetchable(pc)) { g_m68ki_bad_pc = pc; return M68KI_HALT_BADADDR; }
+        if (X_TIMED) XI_BOUNDARY(pc);
+
+        M68KInstr ins;
+        if (!m68k_decode(busview(), pc, &ins)) {
+            g_m68ki_bad_pc = pc; g_m68ki_bad_op = m68k_read16(pc);
+            return M68KI_HALT_UNIMPL;
+        }
+        if (X_TIMED) XI_CHARGE(pc, 7u * (uint32_t)m68k_cycles_exact(&ins));
+        ++g_m68ki_insn_total; ++g_m68ki_insn_count;
+
+        if (ins.mnemonic == MN_RTE) {
+            g_cpu.SR = (uint16_t)m68k_read16(g_cpu.A[7]); g_cpu.A[7] += 2;
+            g_cpu.PC = m68k_read32(g_cpu.A[7]);            g_cpu.A[7] += 4;
+            XSR();
+            g_rte_pending = 1;
+            return M68KI_OK;
+        }
+        if (depth == 0 && (ins.mnemonic == MN_RTS || ins.mnemonic == MN_RTR)) {
+            if (ins.mnemonic == MN_RTR) {
+                uint16_t ccr = pop16();
+                g_cpu.SR = (uint16_t)((g_cpu.SR & 0xFF00u) | (ccr & 0xFFu));
+            }
+            g_xrts = pop32() & 0xFFFFFFu;
+            g_cpu.PC = g_xrts;
+            if (out_exit_pc) *out_exit_pc = g_xrts;
+            return M68KI_OK;
+        }
+
+        uint32_t next;
+        s_illegal_ea = 0;
+        M68kiStatus st = exec_one(&ins, &next);
+        if (st != M68KI_OK) return st;
+        if (s_illegal_ea) {
+            g_m68ki_bad_pc = ins.addr; g_m68ki_bad_op = ins.words[0];
+            return M68KI_HALT_UNIMPL;
+        }
+        g_cpu.PC = next & 0xFFFFFFu;
+
+        if (ins.mnemonic == MN_JSR || ins.mnemonic == MN_BSR)
+            depth++;
+        else if (ins.mnemonic == MN_RTS || ins.mnemonic == MN_RTR)
+            depth--;
+        /* No instruction guard: a wait loop in RAM code is legitimate here (the fiber parks
+         * at the slice end and interrupts run at the boundaries), as in generated code. */
+    }
+}
+
 M68kiStatus m68k_interp_run_ram_handler(uint32_t entry_pc, uint32_t *out_exit_pc)
 {
+    if (g_exact) {
+        int saved = s_xmode;
+        s_xmode = g_game_spec.stepped ? 2 : 1;
+        M68kiStatus st = run_ram_handler_exact(entry_pc, out_exit_pc);
+        s_xmode = saved;
+        return st;
+    }
     g_cpu.PC = entry_pc & 0xFFFFFFu;
     g_m68ki_insn_count = 0;
     g_m68ki_discover_count = 0;

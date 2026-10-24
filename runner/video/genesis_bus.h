@@ -52,7 +52,7 @@ typedef struct GenesisBus {
 
     /* Controllers / I-O. */
     uint16_t pad[2];                    /* live button state (GPAD_* bits, 12) */
-    uint8_t  pad_type[2];               /* 0 = 3-button, 1 = 6-button          */
+    uint8_t  pad_type[2];               /* 0 = 3-button, 1 = 6-button, 2 = none */
     uint8_t  pad_th_count[2];           /* 6-button TH 1->0 edge counter       */
     uint8_t  pad_th_prev[2];            /* previous TH level (edge detect)     */
     uint8_t  io_data[3];                /* last value written to data ports   */

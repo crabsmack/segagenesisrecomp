@@ -114,6 +114,7 @@ function(genesisrecomp_runner_sources out_var)
     endif()
     list(APPEND _list
         "${GENESIS_RUNNER_ENGINE_ROOT}/recompiler/src/m68k_decoder.c"
+        "${GENESIS_RUNNER_ENGINE_ROOT}/recompiler/src/m68k_cycles.c"
         "${GENESIS_RUNNER_ENGINE_ROOT}/recompiler/src/rom_parser.c")
     set(${out_var} "${_list}" PARENT_SCOPE)
 endfunction()

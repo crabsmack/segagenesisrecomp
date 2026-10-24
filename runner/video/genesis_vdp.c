@@ -603,9 +603,15 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
     uint16_t sat = (uint16_t)((REG_SPRITE_NT(v) & 0x7F) << 9);
 
     /* Tracks the first opaque sprite owner per pixel (first-wins; a second
-     * opaque hit raises the collision flag). */
-    static uint8_t drawn[GVDP_MAX_WIDTH];
-    memset(drawn, 0, (size_t)total);
+     * opaque hit raises the collision flag). Indexed from -SPR_BORDER: like the
+     * reference (Genesis Plus GX draws an on-screen sprite's whole width into a
+     * line buffer with a 32-pixel border on each side), the pixels of a sprite
+     * that is at least partly visible collide also where they fall outside the
+     * screen. */
+    enum { SPR_BORDER = 32 };
+    static uint8_t drawn_buf[GVDP_MAX_WIDTH + 2 * SPR_BORDER];
+    uint8_t *drawn = drawn_buf + SPR_BORDER;
+    memset(drawn_buf, 0, (size_t)total + 2 * SPR_BORDER);
 
     int link = 0, on_line = 0, pixels_budget = total;
 
@@ -643,6 +649,8 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             int hf   = (attr & 0x0800) != 0;
             int vf   = (attr & 0x1000) != 0;
             int width = hsz * 8;
+            /* partly on screen: off-screen pixels still collide (see drawn) */
+            int coll = screen_x + width > 0 && screen_x < total;
 
             int iy = vf ? (height - 1 - (line - y)) : (line - y);
             int celly = iy >> cell_h_shift, fy = iy & ((1 << cell_h_shift) - 1);
@@ -660,10 +668,12 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
                     ((uint32_t)v->vram[pa + 2] << 8) | v->vram[pa + 3];
                 for (int fx = 0; fx < 8; ++fx) {
                     int sx = screen_x + cell * 8 + fx;
-                    if (sx < 0 || sx >= total) continue;
+                    int off = sx < 0 || sx >= total;
+                    if (off && !coll) continue;
                     int nib = (bits >> (28 - (fx ^ (hf ? 7 : 0)) * 4)) & 15;
                     if (!nib) continue;
                     if (drawn[sx]) { v->sprite_collision = 1; continue; }
+                    if (off) { drawn[sx] = 1; continue; }
                     if (sh_mode && pal == 3 && nib == 14)
                         s_spr_hilite_op[sx] = 1;
                     else if (sh_mode && pal == 3 && nib == 15)
@@ -679,7 +689,8 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
 #else
             for (int lx = 0; lx < width; lx++) {
                 int sx = screen_x + lx;
-                if (sx < 0 || sx >= total) continue;
+                int off = sx < 0 || sx >= total;
+                if (off && !coll) continue;
                 int ix = hf ? (width - 1 - lx) : lx;
                 int cellx = ix >> 3, fx = ix & 7;
                 int tileno = (tile + cellx * vsz + celly) & 0x07FF;
@@ -689,6 +700,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
                 if (nib == 0) continue;            /* transparent             */
 
                 if (drawn[sx]) { v->sprite_collision = 1; continue; } /* first wins */
+                if (off) { drawn[sx] = 1; continue; }
 
                 if (sh_mode && pal == 3 && nib == 14) {        /* highlight op */
                     s_spr_hilite_op[sx] = 1;

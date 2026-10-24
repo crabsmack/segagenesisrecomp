@@ -906,7 +906,8 @@ static void collect_sim_input(GenesisSimInput *in)
         GPAD_B,  GPAD_C,    GPAD_A,    GPAD_START };
     memset(in, 0, sizeof *in);
     for (int port = 0; port < 2; port++) {
-        in->pad_type[port] = g_input_map.p[port].pad_type == PAD_6BUTTON ? 1 : 0;
+        in->pad_type[port] = g_input_map.p[port].pad_type == PAD_6BUTTON ? 1
+                           : g_input_map.p[port].pad_type == PAD_NONE ? 2 : 0;
         uint16_t pad_mask = 0;
         for (int b = 0; b < 8; b++)
             if (input_requested_cb(NULL, (cc_u8f)port, own_btns[b]))

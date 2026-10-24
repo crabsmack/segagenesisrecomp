@@ -211,6 +211,9 @@ static uint8_t pad_read(const GenesisBus *b, int port)
     uint8_t  th = b->io_data[port] & 0x40;     /* TH select line               */
     /* Buttons are active-low (0 = pressed). */
 
+    if (b->pad_type[port] == 2)                /* unplugged: lines pulled up   */
+        return 0x7F;
+
     if (b->pad_type[port] == 1) {              /* 6-button extended protocol   */
         uint8_t c = b->pad_th_count[port];
         if (th) {                              /* TH = 1 */
@@ -299,7 +302,7 @@ uint16_t gbus_read16(GenesisBus *b, uint32_t a)
     }
     if (a < 0x400000u)
         return (uint16_t)((g_rom[a] << 8) | g_rom[a + 1]);          /* ROM     */
-    if (a >= 0xFF0000u) {                                            /* RAM     */
+    if (a >= 0xE00000u) {                                            /* RAM     */
         uint16_t o = (uint16_t)(a & 0xFFFFu);
         return (uint16_t)((g_ram[o] << 8) | g_ram[(uint16_t)(o + 1)]);
     }
@@ -347,7 +350,7 @@ uint16_t gbus_peek16(const GenesisBus *b, uint32_t a)
     }
     if (a < 0x400000u)
         return (uint16_t)((g_rom[a] << 8) | g_rom[a + 1]);
-    if (a >= 0xFF0000u) {
+    if (a >= 0xE00000u) {
         uint16_t o = (uint16_t)(a & 0xFFFFu);
         return (uint16_t)((g_ram[o] << 8) | g_ram[(uint16_t)(o + 1)]);
     }
@@ -386,7 +389,7 @@ uint8_t gbus_peek8(const GenesisBus *b, uint32_t a)
 void gbus_write16(GenesisBus *b, uint32_t a, uint16_t v)
 {
     a &= 0xFFFFFFu;
-    if (a >= 0xFF0000u) {                                            /* RAM     */
+    if (a >= 0xE00000u) {                                            /* RAM     */
         uint16_t o = (uint16_t)(a & 0xFFFFu);
         g_ram[o] = (uint8_t)(v >> 8); g_ram[(uint16_t)(o + 1)] = (uint8_t)v;
         return;
@@ -457,7 +460,7 @@ void gbus_write8(GenesisBus *b, uint32_t a, uint8_t v)
 {
     a &= 0xFFFFFFu;
     /* Byte writes to RAM / Z80 RAM / PSG / FM need exact targeting. */
-    if (a >= 0xFF0000u) { g_ram[a & 0xFFFFu] = v; return; }
+    if (a >= 0xE00000u) { g_ram[a & 0xFFFFu] = v; return; }
     if (a >= 0xA00000u && a < 0xA10000u) {
         if ((a & 0xFFFFu) < 0x2000u) { unsigned off = a & 0x1FFFu;
             snd_trace_68k_write((uint16_t)off, b->z80_ram[off], v,

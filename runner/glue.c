@@ -1856,7 +1856,7 @@ static int host_is_z80_ram(uint32_t addr)
 void glue_poke8(uint32_t addr, uint8_t val)
 {
     addr &= 0xFFFFFFu;
-    if (addr >= 0xFF0000u) { g_ram[addr & 0xFFFFu] = val; return; }
+    if (addr >= 0xE00000u) { g_ram[addr & 0xFFFFu] = val; return; }
     if (host_is_z80_ram(addr)) { g_machine.bus.z80_ram[addr & 0x1FFFu] = val; return; }
     /* SRAM (exact byte), ROM (ignored) and device ports: the bus's own write
      * semantics, which touch no 68K scheduler state. */
@@ -1866,7 +1866,7 @@ void glue_poke8(uint32_t addr, uint8_t val)
 void glue_poke16(uint32_t addr, uint16_t val)
 {
     addr &= 0xFFFFFFu;
-    if (addr >= 0xFF0000u) {
+    if (addr >= 0xE00000u) {
         uint16_t o = (uint16_t)(addr & 0xFFFFu);
         g_ram[o] = (uint8_t)(val >> 8);
         g_ram[(uint16_t)(o + 1u)] = (uint8_t)val;

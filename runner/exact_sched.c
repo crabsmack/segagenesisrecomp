@@ -187,7 +187,11 @@ static void set_irq_delay(unsigned level)
      * the check, unless the write came from a MOVE.L (the reference cannot
      * split one), in which case the check follows the MOVE.L. */
     if (!s_irq_latency) {
-        uint16_t op = (uint16_t)((g_rom[g_xpc & 0x3FFFFFu] << 8) | g_rom[(g_xpc + 1) & 0x3FFFFFu]);
+        /* the writing instruction's opcode: in work RAM when it is RAM-resident code */
+        uint32_t a = g_xpc & 0xFFFFFFu;
+        uint16_t op = a >= 0xE00000u
+            ? (uint16_t)((g_ram[a & 0xFFFFu] << 8) | g_ram[(a + 1) & 0xFFFFu])
+            : (uint16_t)((g_rom[a & 0x3FFFFFu] << 8) | g_rom[(a + 1) & 0x3FFFFFu]);
         if ((op & 0xF000) != 0x2000) s_irq_latency = 1;
         else                         s_check_now = 1;
     }
@@ -779,7 +783,8 @@ static uint8_t io_read(unsigned off)
     switch (off) {
     case 0x01: case 0x02: case 0x03: {
         uint8_t mask = (uint8_t)(0x80 | s_io_reg[off + 3]);
-        uint8_t data = off == 3 ? 0x7F : pad_read((int)off - 1);
+        /* port C and an unplugged pad port: the reference's dummy_read */
+        uint8_t data = off == 3 || g_machine.bus.pad_type[off - 1] == 2 ? 0x7F : pad_read((int)off - 1);
         return (uint8_t)((s_io_reg[off] & mask) | (data & ~mask));
     }
     default:
@@ -821,9 +826,17 @@ static uint16_t open_bus16(void)
 {
     static GenesisRom rom;
     M68KInstr in;
-    uint32_t next = g_xpc + 2;
+    uint32_t pc = g_xpc & 0xFFFFFFu, next = pc + 2;
+    if (pc >= 0xE00000u) {    /* RAM-resident code: decode its own bytes, prefetch from RAM */
+        uint8_t buf[2 * M68K_MAX_WORDS];
+        GenesisRom ram = { 0 };
+        for (unsigned i = 0; i < sizeof buf; i++) buf[i] = g_ram[(pc + i) & 0xFFFFu];
+        ram.rom_data = buf; ram.rom_size = sizeof buf;
+        if (m68k_decode(&ram, 0, &in)) next = pc + in.byte_length;
+        return (uint16_t)((g_ram[next & 0xFFFFu] << 8) | g_ram[(next + 1) & 0xFFFFu]);
+    }
     if (!rom.rom_data) { rom.rom_data = g_rom; rom.rom_size = 0x400000u; }
-    if (m68k_decode(&rom, g_xpc & 0x3FFFFFu, &in)) next = g_xpc + in.byte_length;
+    if (m68k_decode(&rom, pc & 0x3FFFFFu, &in)) next = pc + in.byte_length;
     next &= 0x3FFFFFu;
     return (uint16_t)((g_rom[next] << 8) | g_rom[next + 1]);
 }
@@ -1348,8 +1361,8 @@ static void shared_dump(void)
 uint16_t xbus_read16(uint32_t a)
 {
     a &= 0xFFFFFFu;
-    if (s_shared && a >= 0xFF0000u) shared_mark(a, 2, 0);
-    if (a >= 0xFF0000u) return (uint16_t)((g_ram[a & 0xFFFF] << 8) | g_ram[(a + 1) & 0xFFFF]);
+    if (s_shared && a >= 0xE00000u) shared_mark(a, 2, 0);
+    if (a >= 0xE00000u) return (uint16_t)((g_ram[a & 0xFFFF] << 8) | g_ram[(a + 1) & 0xFFFF]);
     if (a < 0x400000u)  return (uint16_t)((g_rom[a] << 8) | g_rom[a + 1]);
     if ((s_rp_hw || g_xhw_hook) && is_hw(a)) return hw_read(a, 2);
     return dev_read16(a);
@@ -1358,8 +1371,8 @@ uint16_t xbus_read16(uint32_t a)
 uint8_t xbus_read8(uint32_t a)
 {
     a &= 0xFFFFFFu;
-    if (s_shared && a >= 0xFF0000u) shared_mark(a, 1, 0);
-    if (a >= 0xFF0000u) return g_ram[a & 0xFFFF];
+    if (s_shared && a >= 0xE00000u) shared_mark(a, 1, 0);
+    if (a >= 0xE00000u) return g_ram[a & 0xFFFF];
     if (a < 0x400000u)  return g_rom[a];
     if ((s_rp_hw || g_xhw_hook) && is_hw(a)) return (uint8_t)hw_read(a, 1);
     return dev_read8(a);
@@ -1393,8 +1406,8 @@ static void z80_area_w8(uint32_t a, uint8_t v)
 void xbus_write16(uint32_t a, uint16_t v)
 {
     a &= 0xFFFFFFu;
-    if (s_shared && a >= 0xFF0000u) shared_mark(a, 2, 1);
-    if (a >= 0xFF0000u) { g_ram[a & 0xFFFF] = (uint8_t)(v >> 8); g_ram[(a + 1) & 0xFFFF] = (uint8_t)v; return; }
+    if (s_shared && a >= 0xE00000u) shared_mark(a, 2, 1);
+    if (a >= 0xE00000u) { g_ram[a & 0xFFFF] = (uint8_t)(v >> 8); g_ram[(a + 1) & 0xFFFF] = (uint8_t)v; return; }
     if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 2, 2, v, NULL)) return;
     if (vdp_port(a)) { vdp_w16(a, v); return; }
     if (a >= 0xA00000u && a < 0xA10000u) { z80_area_w8(a, (uint8_t)(v >> 8)); return; }
@@ -1407,8 +1420,8 @@ void xbus_write16(uint32_t a, uint16_t v)
 void xbus_write8(uint32_t a, uint8_t v)
 {
     a &= 0xFFFFFFu;
-    if (s_shared && a >= 0xFF0000u) shared_mark(a, 1, 1);
-    if (a >= 0xFF0000u) { g_ram[a & 0xFFFF] = v; return; }
+    if (s_shared && a >= 0xE00000u) shared_mark(a, 1, 1);
+    if (a >= 0xE00000u) { g_ram[a & 0xFFFF] = v; return; }
     if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 1, 2, v, NULL)) return;
     if (a >= 0xA00000u && a < 0xA10000u) { z80_area_w8(a, v); return; }
     if (a >= 0xA10000u && a < 0xA10020u) { if (a & 1) io_write((a >> 1) & 0x0F, v); return; }

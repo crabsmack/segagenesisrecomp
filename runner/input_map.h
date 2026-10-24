@@ -39,7 +39,10 @@ typedef enum InputDevice {
 } InputDevice;
 
 /* Pad protocol exposed on the controller port. */
-typedef enum PadType { PAD_3BUTTON = 0, PAD_6BUTTON = 1 } PadType;
+/* PAD_NONE: nothing plugged in; the port's data lines read as pulled up ($7F
+ * under the TH/control mask), as the reference emulator's unconnected port does.
+ * An idle pad differs: it drives the left/right lines low while TH is low. */
+typedef enum PadType { PAD_3BUTTON = 0, PAD_6BUTTON = 1, PAD_NONE = 2 } PadType;
 
 /* A gamepad binding: an SDL_GameController button, or an axis + direction. */
 typedef enum GamepadBindKind {

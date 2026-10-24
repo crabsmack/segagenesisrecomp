@@ -262,7 +262,12 @@ void x68k_slice(uint32_t pc);
 void x68k_sr_written(void);
 void x68k_trace(uint32_t pc);
 void x68k_divide_by_zero(uint32_t next_pc);
-#define XI(pc, c) do { if (g_xclk >= g_xend) x68k_slice(pc); g_xpc = (pc); \
+#define XI(pc, c) do { XI_BOUNDARY(pc); XI_CHARGE(pc, c); } while (0)
+/* XI's two halves: the boundary (slice end / interrupt) and the start of the instruction with
+ * its cost. The interpreter (RAM-resident code) decodes between them: an interrupt taken at
+ * the boundary may patch the very instruction it interrupted, which hardware refetches. */
+#define XI_BOUNDARY(pc) do { if (g_xclk >= g_xend) x68k_slice(pc); } while (0)
+#define XI_CHARGE(pc, c) do { g_xpc = (pc); \
     g_xstart = g_xclk; if (g_xtrace) x68k_trace(pc); g_xclk += (c); g_xinsn++; \
     if (g_cpu.A[7] < g_xa7min) g_xa7min = g_cpu.A[7]; } while (0)
 /* game.toml entry_hooks: a game function entered at its own start (a call of
