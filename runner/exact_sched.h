@@ -57,6 +57,11 @@ void    exact_ym_write(uint32_t t, unsigned port, uint8_t v);
 /* Z80 time of the current access (genesis_machine.c, during a Z80 step). */
 uint32_t machine_z80_now(void);
 
+/* Frame-synchronous mode (GameSpec.stepped, no replay log): 0 = its sync points render no frame
+   (main.c --no-render). The render changes nothing the game reads there (the status it reads
+   shows no sprite flags), so only the picture is lost. Set before the first frame. */
+void exact_set_render(int on);
+
 /* Host inspection (no side effects). */
 uint16_t exact_peek_status(void);
 

@@ -1192,10 +1192,14 @@ static void fsync_z80_frame(void);
    that resumed the game. */
 static GenesisScanlineSink s_fs_sink;
 static void *s_fs_user;
+static int s_fs_no_render;   /* exact_set_render(0): no picture (configuration, not state) */
+
+void exact_set_render(int on) { s_fs_no_render = !on; }
 
 static void fsync_render(void)
 {
     extern void machine_render_line(int line, GenesisScanlineSink sink, void *user);
+    if (s_fs_no_render) return;
     int h = (REG(1) & 0x04) ? ((REG(1) & 0x08) ? 240 : 224) : 192;
     for (int line = 0; line < h; line++) machine_render_line(line, s_fs_sink, s_fs_user);
 }
