@@ -262,6 +262,10 @@ extern uint32_t g_xrts;    /* where the last RTS returned (68000 stack), exact m
  * handler`), is where the 68000 continues: the dispatcher runs it next
  * (x68k_resume, called by the generated tail-call drain). */
 #define XAWAIT_MAX 4096
+/* An await that takes any return: a C caller that runs one function and wants control back at
+ * its RTS wherever it returns (a test harness comparing where it went; C calling 68000 code),
+ * as every call did before returns nobody waits for. */
+#define XAWAIT_ANY 0xFFFFFFFFu
 extern uint32_t g_xawait[XAWAIT_MAX];
 extern int      g_xawait_n;
 extern int      g_xrts_new;  /* an RTS set g_xrts and no call site has taken it yet */

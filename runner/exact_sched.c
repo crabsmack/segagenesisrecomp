@@ -41,7 +41,7 @@ int x68k_resume(uint32_t *addr)
         return 0;
     int n = g_xawait_n < XAWAIT_MAX ? g_xawait_n : XAWAIT_MAX;
     for (int i = n; i-- > 0;)
-        if (g_xawait[i] == g_xrts)
+        if (g_xawait[i] == g_xrts || g_xawait[i] == XAWAIT_ANY)
             return 0;              /* an enclosing call site takes it: unwind to it */
     g_xrts_new = 0;
     *addr = g_xrts;
