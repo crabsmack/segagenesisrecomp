@@ -172,6 +172,7 @@ static int run_picker_cmd(const char *cmd, char *out, size_t max_len)
 #include "sim_step.h"
 #include "rb_probe.h"
 #include "rb_state.h"
+#include "exact_sched.h"
 
 
 #include "cmd_server.h"
@@ -2263,6 +2264,9 @@ int main(int argc, char *argv[])
      * one-shot regression test. */
     uint32_t hash_frames = 0;
     int      hash_on_mode = 0;   /* --hash-on-mode: hash on Game_Mode transitions (pacing-invariant) */
+    /* --no-render: the frame-synchronous runner's sync points render no frame (exact_sched.c
+     * fsync_render), for --benchmark runs that compare no picture. */
+    int      no_render = 0;
 
     /* --input-script PATH — load a .input scripting file (button
      * timeline + RAM assertions + EXIT). See runner/input_script.h
@@ -2357,6 +2361,8 @@ int main(int argc, char *argv[])
             hash_frames = (uint32_t)atol(argv[++i]);
         } else if (strcmp(argv[i], "--hash-on-mode") == 0) {
             hash_on_mode = 1;
+        } else if (strcmp(argv[i], "--no-render") == 0) {
+            no_render = 1;
         } else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc) {
             input_script_path = argv[++i];
         } else if (strcmp(argv[i], "--branch-plan") == 0 && i + 1 < argc) {
@@ -2403,6 +2409,14 @@ int main(int argc, char *argv[])
         max_frames = benchmark_frames;
         start_turbo = 1;
         no_launcher = 1;
+    }
+    if (no_render) {
+        if (!benchmark_frames || hash_frames || hash_on_mode || !g_game_spec.stepped) {
+            fprintf(stderr, "--no-render needs --benchmark N, no --hash-frames / --hash-on-mode, "
+                            "and a frame-synchronous runner (GameSpec.stepped)\n");
+            return 2;
+        }
+        exact_set_render(0);
     }
 
     /* ---- Settings + pre-boot launcher ------------------------------------

@@ -172,6 +172,13 @@ a `[FBHASH] frame=N w=W h=H hash=0xHEX` stderr line every N wall frames).
 zone_smoke wires these together: launches the runner, parses the FBHASH
 lines, diffs against a checked-in baseline JSON.
 
+The other way round, `--no-render` (with `--benchmark N`, not with the hash
+options) makes a frame-synchronous runner (`GameSpec.stepped`) render no
+frame at its sync points (`exact_sched.c` `fsync_render`): for headless
+traces that compare state rows and no picture. The render changes nothing
+the game reads in that mode (the status it reads shows no sprite flags), so
+the rows are the same; only the framebuffer stays empty.
+
 Per-game wrappers:
 
 - Sonic 2: `_smoke.bat` at the release repo root.
