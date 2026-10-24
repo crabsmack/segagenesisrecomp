@@ -34,7 +34,7 @@ typedef void (*GenesisScanlineSink)(void *user, int line, const uint32_t *argb, 
 
 void machine_init(void);
 void machine_set_pad(int port, uint16_t buttons);  /* GPAD_* bits (12)         */
-void machine_set_pad_type(int port, int six_button); /* 0 = 3-btn, 1 = 6-btn  */
+void machine_set_pad_type(int port, int type);  /* 0 = 3-btn, 1 = 6-btn, 2 = none */
 
 /* Own-backend save states: snapshot/restore the whole machine (+ hidden Z80
  * ext bits), re-wiring internal pointers and derived caches on load. Returns

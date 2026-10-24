@@ -365,9 +365,9 @@ void machine_set_pad(int port, uint16_t buttons)
     }
 }
 
-void machine_set_pad_type(int port, int six_button)
+void machine_set_pad_type(int port, int type)
 {
-    if (port >= 0 && port < 2) g_machine.bus.pad_type[port] = six_button ? 1 : 0;
+    if (port >= 0 && port < 2) g_machine.bus.pad_type[port] = (uint8_t)(type == 1 || type == 2 ? type : 0);
 }
 
 /* NTSC raster timing. */
