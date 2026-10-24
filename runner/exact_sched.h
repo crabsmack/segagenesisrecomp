@@ -31,6 +31,7 @@
 #ifndef GENESIS_EXACT_SCHED_H
 #define GENESIS_EXACT_SCHED_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "video/genesis_machine.h"
 
@@ -58,6 +59,11 @@ uint32_t machine_z80_now(void);
 
 /* Host inspection (no side effects). */
 uint16_t exact_peek_status(void);
+
+/* Rollback snapshot of the scheduler (rb_state.c section "exact"; 0 bytes when not in exact
+   mode). The save fails while a replay log is open. */
+size_t exact_rb_save(void *dst, size_t cap);
+int    exact_rb_load(const void *src, size_t len);
 
 #ifdef __cplusplus
 }

@@ -276,6 +276,16 @@ typedef struct GameSpec {
      * launch is then refused. NULL = nothing to adopt. */
     int       (*netplay_config_adopt)(const char *line);
 
+    /* ---- Branch plans (main.c --branch-plan) ----
+     * The game's host state outside the rollback snapshot that a branch must
+     * not carry back into the run it branched from (an observer's results,
+     * counters): branch_save keeps it at the branch point, branch_restore puts
+     * it back after each branch. branch_end(tag) writes the branch's outputs,
+     * before the restore. NULL = nothing to keep / write. */
+    void      (*branch_save)(void);
+    void      (*branch_restore)(void);
+    void      (*branch_end)(const char *tag);
+
     /* Verified-clean native overrides. Native builds typically run
      * with size=0 (everything stays as recompiled C); oracle builds
      * use this to swap interpreter execution for native execution

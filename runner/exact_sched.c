@@ -1614,6 +1614,60 @@ static void fsync_z80_frame(void)
     s_zclk -= F;
 }
 
+/* ======================================================================== */
+/* Rollback snapshot (rb_state.c section "exact"): the scheduler's state      */
+/* between ticks. Everything above that a tick reads or writes, as raw bytes  */
+/* (no host pointers). Left out: the configuration (s_stepped, s_fsync), the  */
+/* diagnostics (traces, the shared-access map, s_fnmap) and the replay log,   */
+/* whose file position no snapshot can rewind: a save with a log open fails.  */
+#define XS(v) { &(v), sizeof(v) }
+static const struct { void *p; size_t n; } k_exact_rb[] = {
+    XS(g_xclk), XS(g_xstart), XS(g_xend), XS(g_xpc), XS(g_xrts), XS(g_xa7min), XS(g_xirq_taken),
+    XS(g_xirq_hold), XS(g_xtrace), XS(g_xawait), XS(g_xawait_n), XS(g_xrts_new), XS(s_irq_depth),
+    XS(g_xabort), XS(s_depth), XS(s_end), XS(s_mline),
+    XS(s_int_level), XS(s_irq_latency), XS(s_irq_latency_pc), XS(s_check_now),
+    XS(s_status), XS(s_hint_pending), XS(s_vint_pending), XS(s_hcounter), XS(s_vcounter),
+    XS(s_view_h), XS(s_view_changed), XS(s_pending), XS(s_addr_latch), XS(s_cached_write),
+    XS(s_hvc_latch), XS(s_dma_length), XS(s_dma_type), XS(s_dma_end), XS(s_dmafill), XS(s_dma_src),
+    XS(s_fifo), XS(s_fifo_idx), XS(s_fifo_write_cnt), XS(s_fifo_slots), XS(s_fifo_byte_access),
+    XS(s_fifo_cycles), XS(s_io_reg), XS(s_pad_state), XS(s_pad_counter), XS(s_pad_timeout),
+    XS(s_zclk), XS(s_zstate), XS(s_zaccess), XS(s_zirq), XS(s_frame_no),
+    XS(s_npend), XS(g_xinsn), XS(s_irq_insn0), XS(s_pos), XS(s_sync_no),
+    XS(s_fm_count), XS(s_fm_start), XS(s_fm_ta), XS(s_fm_tal), XS(s_fm_tac), XS(s_fm_tbl),
+    XS(s_fm_tbc), XS(s_fm_mode), XS(s_fm_status), XS(s_fm_addr),
+};
+#undef XS
+
+size_t exact_rb_save(void *dst, size_t cap)
+{
+    size_t need = 0;
+    if (!g_exact) return 0;
+    for (size_t i = 0; i < sizeof k_exact_rb / sizeof k_exact_rb[0]; i++) need += k_exact_rb[i].n;
+    if (!dst) return need;
+    if (cap < need) return 0;
+    if (s_rp_out || s_rp_in) {
+        fprintf(stderr, "[exact] snapshot: a replay log (GENESIS_REPLAY_OUT/IN) is open\n");
+        return 0;
+    }
+    uint8_t *o = (uint8_t *)dst;
+    for (size_t i = 0; i < sizeof k_exact_rb / sizeof k_exact_rb[0]; i++) {
+        memcpy(o, k_exact_rb[i].p, k_exact_rb[i].n);
+        o += k_exact_rb[i].n;
+    }
+    return need;
+}
+
+int exact_rb_load(const void *src, size_t len)
+{
+    if (len != exact_rb_save(NULL, 0)) return 0;
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < sizeof k_exact_rb / sizeof k_exact_rb[0]; i++) {
+        memcpy(k_exact_rb[i].p, s, k_exact_rb[i].n);
+        s += k_exact_rb[i].n;
+    }
+    return 1;
+}
+
 void exact_reset(void)
 {
     g_xclk = g_xstart = 40u * MCLK_68K;   /* reset exception */
