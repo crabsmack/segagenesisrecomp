@@ -67,6 +67,11 @@ typedef struct GVDP {
     /* Memories */
     uint8_t  vram[GVDP_VRAM_SIZE];
     uint16_t cram[GVDP_CRAM_ENTRIES];          /* stored as 9-bit BGR          */
+    /* The VDP's internal sprite attribute cache (68000 byte order, like vram):
+     * each sprite's Y, size and link are read from here, name/attributes and X
+     * from VRAM. Written by every VRAM write that lands in the current table
+     * (gvdp_sat_byte); not refreshed when register 5 moves the table. */
+    uint8_t  sat[0x400];
     uint16_t vsram[GVDP_VSRAM_ENTRIES];
 
     /* Register file ($00..$17). */
@@ -168,6 +173,10 @@ uint32_t gvdp_consume_68k_stall(GVDP *v);
 /* Raw VRAM (odd address = byte-swapped word) / CRAM / VSRAM stores, no
    auto-increment: the exact scheduler's port layer (runner/exact_sched.c). */
 void gvdp_store_vram_word(GVDP *v, uint16_t addr, uint16_t value);
+/* A byte just written to VRAM at `addr` (68000 byte order): mirror it into the
+ * sprite attribute cache when it lands in the current table. Every VRAM write
+ * path calls it (word stores do it themselves). */
+void gvdp_sat_byte(GVDP *v, uint16_t addr, uint8_t b);
 void gvdp_store_cram(GVDP *v, uint16_t addr, uint16_t value);
 void gvdp_store_vsram(GVDP *v, uint16_t addr, uint16_t value);
 

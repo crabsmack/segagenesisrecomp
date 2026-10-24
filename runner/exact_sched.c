@@ -391,6 +391,7 @@ static void dma_copy(uint32_t bytes)
     uint16_t source = (uint16_t)s_dma_src;
     do {
         v->vram[(uint16_t)(v->address ^ 1)] = v->vram[(uint16_t)(source ^ 1)];
+        gvdp_sat_byte(v, (uint16_t)(v->address ^ 1), v->vram[(uint16_t)(v->address ^ 1)]);
         source++;
         v->address = (uint16_t)(v->address + REG(15));
     } while (--bytes);
@@ -405,6 +406,7 @@ static void dma_fill(uint32_t bytes)
         uint8_t data = (uint8_t)(s_fifo[(s_fifo_idx + 3) & 3] >> 8);
         do {
             v->vram[(uint16_t)(v->address ^ 1)] = data;
+            gvdp_sat_byte(v, (uint16_t)(v->address ^ 1), data);
             v->address = (uint16_t)(v->address + REG(15));
         } while (--bytes);
         break;

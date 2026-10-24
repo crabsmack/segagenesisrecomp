@@ -160,6 +160,23 @@ static void vram_write_word(GVDP *v, uint16_t addr, uint16_t value)
     uint16_t a = addr & 0xFFFE;
     if (addr & 1) { v->vram[a] = (uint8_t)value; v->vram[(uint16_t)(a + 1)] = (uint8_t)(value >> 8); }
     else          { v->vram[a] = (uint8_t)(value >> 8); v->vram[(uint16_t)(a + 1)] = (uint8_t)value; }
+    gvdp_sat_byte(v, a, v->vram[a]);
+    gvdp_sat_byte(v, (uint16_t)(a + 1), v->vram[(uint16_t)(a + 1)]);
+}
+
+/* The table's base and index bits: 1 KB at a 1 KB boundary in H40, 512 bytes
+ * at a 512-byte boundary in H32 (Genesis Plus GX sat_base_mask / sat_addr_mask). */
+void gvdp_sat_byte(GVDP *v, uint16_t addr, uint8_t b)
+{
+    uint16_t base = MODE4_H40(v) ? 0xFC00 : 0xFE00;
+    if ((addr & base) == (uint16_t)((REG_SPRITE_NT(v) << 9) & base))
+        v->sat[addr & (uint16_t)~base] = b;
+}
+
+static uint16_t sat_read_word(const GVDP *v, uint16_t off)
+{
+    off &= 0x3FE;
+    return (uint16_t)((v->sat[off] << 8) | v->sat[off + 1]);
 }
 
 static uint16_t vram_read_word(const GVDP *v, uint16_t addr)
@@ -273,6 +290,7 @@ static void dma_run_vram_copy(GVDP *v)
     uint16_t src = (uint16_t)(((uint32_t)REG_DMA_SRC_LO(v)) | ((uint32_t)REG_DMA_SRC_MID(v) << 8));
     while (len--) {
         v->vram[v->address & 0xFFFF] = v->vram[src & 0xFFFF];
+        gvdp_sat_byte(v, v->address, v->vram[v->address & 0xFFFF]);
         src = (uint16_t)(src + 1);
         v->address = (uint16_t)(v->address + REG_AUTOINC(v));
     }
@@ -289,6 +307,7 @@ static void dma_run_vram_fill_data(GVDP *v, uint16_t value)
     v->address = (uint16_t)(v->address + REG_AUTOINC(v));
     while (len--) {
         v->vram[(v->address ^ 1) & 0xFFFF] = fill;
+        gvdp_sat_byte(v, (uint16_t)(v->address ^ 1), fill);
         v->address = (uint16_t)(v->address + REG_AUTOINC(v));
     }
     v->dma_fill_pending = 0;
@@ -616,13 +635,16 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
     int link = 0, on_line = 0, pixels_budget = total;
 
     for (int n = 0; n < max_sprites; n++) {
+        /* Y, size and link from the internal cache, name/attributes and X
+         * from VRAM (as the hardware and the reference do). */
         uint16_t e = (uint16_t)(sat + link * 8);
-        int y      = (vram_read_word(v, e) & 0x3FF) - (im2 ? 256 : 128);
-        uint8_t sz = v->vram[(uint16_t)(e + 2)];
+        uint16_t c = (uint16_t)(link * 8);
+        int y      = (sat_read_word(v, c) & (im2 ? 0x3FF : 0x1FF)) - (im2 ? 256 : 128);
+        uint8_t sz = v->sat[(c + 2) & 0x3FF];
         int hsz    = ((sz >> 2) & 3) + 1;     /* width  in cells (1..4)        */
         int vsz    = (sz & 3) + 1;            /* height in cells (1..4)        */
         int height = vsz << cell_h_shift;
-        int next   = v->vram[(uint16_t)(e + 3)] & 0x7F;
+        int next   = v->sat[(c + 3) & 0x3FF] & 0x7F;
 
         if (line >= y && line < y + height) {
             if (++on_line > max_per_line && !s_unlimited_sprites) { v->sprite_overflow = 1; break; }
@@ -719,7 +741,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             if (pixels_budget <= 0 && !s_unlimited_sprites) { v->sprite_overflow = 1; break; }
         }
 
-        if (next == 0) break;     /* link 0 terminates the list */
+        if (next == 0 || next >= max_sprites) break;   /* link 0, or past the table's end */
         link = next;
     }
 }
