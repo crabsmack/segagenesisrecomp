@@ -146,6 +146,17 @@ int fiber_snapshot_load(fiber_t fiber, const void *src, size_t len);
  * the thread fiber / NULL. Used by rollback diagnostics (stack scans). */
 int fiber_stack_range(fiber_t fiber, uintptr_t *lo, uintptr_t *top);
 
+/* Where the next fiber_create puts its mapping: at `base` (page-aligned; 0,
+ * the default, lets the OS choose). A blob holds the stack's own addresses,
+ * so it loads in ANOTHER process only into a fiber placed at the same base
+ * (fiber_snapshot_load returns -3 otherwise), and only when every other
+ * address the saved frames hold (code, statics, other mappings) is the same
+ * there too: the caller's to arrange (the same executable at its preferred
+ * base, its other mappings placed the same way). If the address is taken,
+ * the mapping goes anywhere with a warning on stderr; fiber_stack_range
+ * shows where it went. */
+void fiber_set_placement(uintptr_t base);
+
 #ifdef __cplusplus
 }
 #endif

@@ -286,6 +286,20 @@ typedef struct GameSpec {
     void      (*branch_restore)(void);
     void      (*branch_end)(const char *tag);
 
+    /* ---- State files (main.c --state-at / --state-load) ----
+     * A branch point for ANOTHER process: the rollback snapshot plus this,
+     * the game's host state outside it (what branch_save keeps), as bytes.
+     * state_file_save returns bytes written (dst NULL = bytes needed);
+     * state_file_load returns 1 on success, 0 to refuse the file, and is
+     * called before the snapshot loads (it can check the process's layout
+     * first). NULL = nothing to carry. game_fiber_base: where the game
+     * fiber's stack is mapped (fiber_set_placement; 0 = anywhere, and no
+     * state file loads in another process: the stack's frames hold its
+     * addresses). */
+    size_t    (*state_file_save)(void *dst, size_t cap);
+    int       (*state_file_load)(const void *src, size_t len);
+    uintptr_t   game_fiber_base;
+
     /* Verified-clean native overrides. Native builds typically run
      * with size=0 (everything stays as recompiled C); oracle builds
      * use this to swap interpreter execution for native execution

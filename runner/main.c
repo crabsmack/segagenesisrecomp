@@ -1527,6 +1527,130 @@ static void branch_tick(uint32_t *frame_num)
 }
 
 /* =========================================================================
+ * State files (--state-at FILE, --state-load FILE; offline --benchmark runs)
+ *
+ * A branch point for ANOTHER process. `--state-at FILE`: lines `FRAME PATH`
+ * in FRAME order; once this run has played FRAME frames (where a branch plan
+ * snapshots), the machine (rb_state.h) and the game's host state outside it
+ * (GameSpec.state_file_save) go to PATH (written as PATH.tmp, then renamed,
+ * so a reader never sees half a file), with `[state] FRAME PATH` on stderr.
+ * `--state-load FILE`: the run starts from such a file, at its frame, its
+ * input script where this run's own stands after that many frames, and
+ * plays on to --benchmark N: what the run plays from power-on, without its
+ * first FRAME frames. The game fiber's stack holds host addresses, so a file
+ * loads only in a process laid out as the one that saved it
+ * (GameSpec.game_fiber_base; the game's hook checks the rest and may refuse).
+ * File: "GXS1", u32 version 1, u32 frame, u32 0, u64 snapshot bytes, u64
+ * game bytes, the snapshot, the game's bytes.
+ * ========================================================================= */
+
+typedef struct { uint32_t at; char path[520]; } StateAt;
+static StateAt *s_st;
+static int      s_st_n, s_st_i;
+static uint32_t s_st_loaded_at;            /* --state-load: the frame this run started from */
+
+static int state_at_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "[state] cannot read %s\n", path); return 0; }
+    char line[800];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        StateAt s;
+        int used = 0;
+        if (line[0] == '#' || strspn(line, " \t\r\n") == strlen(line)) continue;
+        if (sscanf(line, "%u %n", &s.at, &used) != 1 || !used || !s.at) {
+            fprintf(stderr, "[state] %s: bad line: %s", path, line);
+            fclose(f); return 0;
+        }
+        snprintf(s.path, sizeof s.path, "%s", line + used);
+        s.path[strcspn(s.path, "\r\n")] = 0;
+        if (!s.path[0] || (n && s.at <= s_st[n - 1].at)) {
+            fprintf(stderr, "[state] %s: no path, or not after the previous line's frame: %s", path, line);
+            fclose(f); return 0;
+        }
+        StateAt *ns = (StateAt *)realloc(s_st, (size_t)(n + 1) * sizeof *s_st);
+        if (!ns) { fclose(f); return 0; }
+        s_st = ns;
+        s_st[n++] = s;
+    }
+    fclose(f);
+    s_st_n = n;
+    return 1;
+}
+
+static const char k_st_magic[4] = { 'G', 'X', 'S', '1' };
+
+static void state_file_write(uint32_t frame, const char *path)
+{
+    size_t rb_need = genesis_rb_bound();
+    size_t game_need = g_game_spec.state_file_save ? g_game_spec.state_file_save(NULL, 0) : 0;
+    uint8_t *rb = (uint8_t *)malloc(rb_need ? rb_need : 1), *game = (uint8_t *)malloc(game_need ? game_need : 1);
+    size_t rb_len = rb ? genesis_rb_save(rb, rb_need) : 0;
+    size_t game_len = game_need && game ? g_game_spec.state_file_save(game, game_need) : 0;
+    if (!rb_len || (game_need && !game_len)) {
+        fprintf(stderr, "[state] the state at frame %u could not be saved\n", (unsigned)frame);
+        exit(2);
+    }
+    char tmp[540];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    uint32_t head[4] = { 0, 1u, frame, 0 };
+    uint64_t lens[2] = { (uint64_t)rb_len, (uint64_t)game_len };
+    memcpy(head, k_st_magic, sizeof k_st_magic);
+    int ok = f && fwrite(head, sizeof head, 1, f) == 1 && fwrite(lens, sizeof lens, 1, f) == 1 &&
+             fwrite(rb, 1, rb_len, f) == rb_len && (!game_len || fwrite(game, 1, game_len, f) == game_len);
+    if (f && fclose(f) != 0) ok = 0;
+    remove(path);
+    if (!ok || rename(tmp, path) != 0) {
+        fprintf(stderr, "[state] cannot write %s\n", path);
+        exit(2);
+    }
+    free(rb);
+    free(game);
+    fprintf(stderr, "[state] %u %s\n", (unsigned)frame, path);
+}
+
+/* After the main loop has played (and ticked the script for) frame frame_num:
+ * the states due there (before a branch plan's branch of the same frame). */
+static void state_at_tick(uint32_t frame_num)
+{
+    while (s_st_i < s_st_n && s_st[s_st_i].at == frame_num) {
+        state_file_write(frame_num, s_st[s_st_i].path);
+        s_st_i++;
+    }
+}
+
+/* --state-load: everything in place before the main loop's first frame. */
+static int state_file_read(const char *path, uint32_t *frame_num)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[state] cannot read %s\n", path); return 0; }
+    uint32_t head[4];
+    uint64_t lens[2];
+    int ok = fread(head, sizeof head, 1, f) == 1 && fread(lens, sizeof lens, 1, f) == 1 &&
+             !memcmp(head, k_st_magic, sizeof k_st_magic) && head[1] == 1u && lens[0] < (1u << 30) && lens[1] < (1u << 30);
+    uint8_t *rb = ok ? (uint8_t *)malloc((size_t)lens[0] + 1) : NULL, *game = ok ? (uint8_t *)malloc((size_t)lens[1] + 1) : NULL;
+    ok = ok && rb && game && fread(rb, 1, (size_t)lens[0], f) == lens[0] && fread(game, 1, (size_t)lens[1], f) == lens[1];
+    fclose(f);
+    if (!ok) { fprintf(stderr, "[state] %s is not a state file of this runner\n", path); free(rb); free(game); return 0; }
+    if (g_game_spec.state_file_load ? !g_game_spec.state_file_load(game, (size_t)lens[1]) : lens[1] != 0) {
+        fprintf(stderr, "[state] %s: the game refused it\n", path);
+        free(rb); free(game); return 0;
+    }
+    if (!genesis_rb_load(rb, (size_t)lens[0])) {
+        fprintf(stderr, "[state] %s: the snapshot did not load (another process's layout?)\n", path);
+        free(rb); free(game); return 0;
+    }
+    free(rb);
+    free(game);
+    *frame_num = head[2];
+    s_st_loaded_at = head[2];
+    fprintf(stderr, "[state] loaded %s: frame %u\n", path, (unsigned)head[2]);
+    return 1;
+}
+
+/* =========================================================================
  * Frame logging (main-loop version, works in ALL build modes)
  * ========================================================================= */
 
@@ -2274,6 +2398,7 @@ int main(int argc, char *argv[])
      * makes the runner a one-shot regression-test driver. */
     const char *input_script_path = NULL;
     const char *branch_plan_path = NULL;   /* --branch-plan FILE (see "Branch plans") */
+    const char *state_at_path = NULL, *state_load_path = NULL;   /* --state-at / --state-load (see "State files") */
 
     /* Pacing mode override: --pacing fiber|accurate or --pacing=...
      * NULL = not set via CLI (debug.ini may still override; otherwise
@@ -2367,6 +2492,10 @@ int main(int argc, char *argv[])
             input_script_path = argv[++i];
         } else if (strcmp(argv[i], "--branch-plan") == 0 && i + 1 < argc) {
             branch_plan_path = argv[++i];
+        } else if (strcmp(argv[i], "--state-at") == 0 && i + 1 < argc) {
+            state_at_path = argv[++i];
+        } else if (strcmp(argv[i], "--state-load") == 0 && i + 1 < argc) {
+            state_load_path = argv[++i];
         } else if (strcmp(argv[i], "--exec-coverage-out") == 0 && i + 1 < argc) {
             exec_cov_out = argv[++i];
         } else if (strcmp(argv[i], "--yield-log") == 0) {
@@ -2687,6 +2816,13 @@ int main(int argc, char *argv[])
         }
         if (!branch_plan_load(branch_plan_path)) return 2;
         s_br_carrier = input_script_path;
+    }
+    if (state_at_path || state_load_path) {
+        if (!benchmark_frames || !input_script_path) {
+            fprintf(stderr, "--state-at and --state-load need --benchmark N and --input-script\n");
+            return 2;
+        }
+        if (state_at_path && !state_at_load(state_at_path)) return 2;
     }
 
     /* --- Load symbol table for crash reports ---
@@ -3195,6 +3331,15 @@ session_begin:;
         if (g_exact && input_script_active())
             input_script_tick(0, glue_peek8, glue_peek16, glue_poke8, glue_poke16, glue_poke32);
     }
+    if (state_load_path) {   /* "State files": from a saved frame, the script where it stands then */
+        if (!state_file_read(state_load_path, &frame_num)) return 2;
+        if (frame_num >= benchmark_frames || (s_br_n && s_br[0].at < frame_num) || (s_st_n && s_st[0].at <= frame_num)) {
+            fprintf(stderr, "[state] %s is of frame %u: past this run's --benchmark, branches or states\n",
+                    state_load_path, (unsigned)frame_num);
+            return 2;
+        }
+        branch_script_seek(input_script_path, frame_num);
+    }
     int      mode_prev = -1;     /* --hash-on-mode: last Game_Mode seen (-1 = none yet) */
     uint32_t mode_seq  = 0;      /* --hash-on-mode: transition sequence counter */
     const Uint64 perf_frequency = SDL_GetPerformanceFrequency();
@@ -3698,6 +3843,7 @@ session_begin:;
                 return input_script_exit_code();
             }
         }
+        if (s_st_n && !s_br_active) state_at_tick(frame_num);
         if (s_br_n) branch_tick(&frame_num);
 
         /* FNV-1a-64 hash of the framebuffer's active region. Emitted
@@ -3933,13 +4079,16 @@ session_begin:;
         Uint64 benchmark_end = SDL_GetPerformanceCounter();
         double seconds = (double)(benchmark_end - benchmark_start)
                        / (double)SDL_GetPerformanceFrequency();
-        double fps = seconds > 0.0 ? (double)frame_num / seconds : 0.0;
+        uint32_t played = frame_num - s_st_loaded_at;   /* --state-load: this process's own frames */
+        char loaded_at[48] = "";
+        if (s_st_loaded_at) snprintf(loaded_at, sizeof loaded_at, ",\"state_loaded_at\":%u", (unsigned)s_st_loaded_at);
+        double fps = seconds > 0.0 ? (double)played / seconds : 0.0;
         double cpu_seconds = benchmark_process_cpu_seconds() - benchmark_cpu_start;
-        double cpu_fps = cpu_seconds > 0.0 ? (double)frame_num / cpu_seconds : 0.0;
+        double cpu_fps = cpu_seconds > 0.0 ? (double)played / cpu_seconds : 0.0;
         uint64_t cpu_cycles =
             benchmark_process_cpu_cycles() - benchmark_cycles_start;
         double cycles_per_frame =
-            frame_num ? (double)cpu_cycles / (double)frame_num : 0.0;
+            played ? (double)cpu_cycles / (double)played : 0.0;
         /* Hash after the timer stops: correctness metadata must not reduce
          * the throughput being measured. The audio fingerprint folds the
          * complete FM, PSG, and pending event-queue state from the same
@@ -3965,10 +4114,10 @@ session_begin:;
                "\"requested_frames\":%u,\"complete\":%s,"
                "\"audio_flushes\":%u,\"mixed_fm_frames\":%llu,"
                "\"mixed_psg_frames\":%llu,\"audio_pushed_frames\":%llu,"
-               "\"audio_overflow_drops\":%llu}\n",
+               "\"audio_overflow_drops\":%llu%s}\n",
                g_game_spec.short_name ? g_game_spec.short_name : "game",
                frame_num, seconds, fps,
-               frame_num ? seconds * 1000.0 / (double)frame_num : 0.0,
+               played ? seconds * 1000.0 / (double)played : 0.0,
                cpu_seconds, cpu_fps,
                (unsigned long long)cpu_cycles, cycles_per_frame,
                (unsigned long long)state_hash,
@@ -3980,7 +4129,7 @@ session_begin:;
                    ? "true" : "false", delivery_stats.total_flushes,
                (unsigned long long)delivery_stats.total_fm_frames,
                (unsigned long long)delivery_stats.total_psg_frames,
-               (unsigned long long)audio_pushed, (unsigned long long)audio_overflow);
+               (unsigned long long)audio_pushed, (unsigned long long)audio_overflow, loaded_at);
         fflush(stdout);
     }
 

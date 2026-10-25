@@ -159,11 +159,21 @@ static void fiber_require_no_shadow_stack(void)
 
 /* ---- mapping ------------------------------------------------------------- */
 
+static uintptr_t s_place_next;   /* fiber_set_placement: the next mapping's base, 0 anywhere */
+
+void fiber_set_placement(uintptr_t base) { s_place_next = base; }
+
 static unsigned char *os_map(size_t size, size_t guard_off, size_t guard_size)
 {
+    void *at = (void *)s_place_next;
 #if defined(_WIN32)
-    unsigned char *m = (unsigned char *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
+    unsigned char *m = (unsigned char *)VirtualAlloc(at, size, MEM_RESERVE | MEM_COMMIT,
                                                      PAGE_READWRITE);
+    if (!m && at) {
+        fprintf(stderr, "[fiber] the stack's place %p is taken (error %lu): mapped anywhere\n",
+                at, (unsigned long)GetLastError());
+        m = (unsigned char *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
     if (!m) return NULL;
     DWORD old = 0;
     if (!VirtualProtect(m + guard_off, guard_size, PAGE_NOACCESS, &old)) {
@@ -172,8 +182,10 @@ static unsigned char *os_map(size_t size, size_t guard_off, size_t guard_size)
     }
     return m;
 #else
-    void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *m = mmap(at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return NULL;
+    if (at && m != at)   /* a hint only: the place was taken */
+        fprintf(stderr, "[fiber] the stack's place %p is taken: mapped at %p\n", at, m);
     if (mprotect((unsigned char *)m + guard_off, guard_size, PROT_NONE) != 0) {
         munmap(m, size);
         return NULL;
