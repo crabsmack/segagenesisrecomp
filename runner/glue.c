@@ -658,6 +658,7 @@ static void game_fiber_func(void *param)
 static int create_game_fiber(uint32_t resume_pc)
 {
     s_game_fiber_resume_pc = resume_pc & 0xFFFFFFu;
+    fiber_set_placement(g_game_spec.game_fiber_base);   /* state files: the stack's addresses */
     s_game_fiber = fiber_create(GAME_FIBER_STACK_SIZE,
                                 GAME_FIBER_STACK_SIZE,
                                 game_fiber_func,
@@ -2565,7 +2566,9 @@ int glue_rb_sched_load(const void *src, size_t len)
 
 /* EXEC: [u64 tail-frame head][u32 fiber blob len][fiber blob]. The blob and
  * the head carry host addresses of THIS process's fiber stack, so an EXEC
- * section is only meaningful in the process that saved it (rollback is). */
+ * section is only meaningful in the process that saved it (rollback is), or
+ * in one laid out the same (main.c "State files": the stack placed at
+ * GameSpec.game_fiber_base, the executable at its preferred base). */
 size_t glue_rb_exec_save(void *dst, size_t cap)
 {
     size_t fb = s_game_fiber ? fiber_snapshot_bound(s_game_fiber) : 0;
