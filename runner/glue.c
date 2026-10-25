@@ -54,7 +54,7 @@ void recomp_push_return(uint32_t ret_addr)
         g_cpu.A[7] = g_game_layout.initial_ssp;
 
     g_cpu.A[7] -= 4;
-    m68k_write32(g_cpu.A[7], ret_addr & 0xFFFFFFu);
+    m68k_write32(g_cpu.A[7], (ret_addr & 0xFFFFFFu) | g_pchi);
 }
 
 /* =========================================================================
@@ -443,6 +443,28 @@ static int s_in_vblank_service = 0;
 
 #include "game_spec.h"      /* g_game_spec.call_entry_point / vblank / hblank / periodic */
 #include "exact_sched.h"    /* g_exact, xbus_* (cycle-exact mode) */
+
+/* Exact mode, a dispatch to RAM code: run it on the exact interpreter as fetched (no trampoline
+ * resolution: a RAM `jmp handler`, e.g. an H-int vector's stub, costs its 12 cycles and is an
+ * instruction like any other), until ROM code generated code can be entered at, then
+ * tail-dispatch that. A return or RTE in the RAM code ends it the hardware way (g_xrts,
+ * g_rte_pending). 1 = handled. */
+int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t))
+{
+    addr &= 0xFFFFFFu;
+    if (!g_exact || addr < RAM_BASE)
+        return 0;
+    uint32_t next = 0;
+    M68kiStatus st = m68k_interp_run_exact_until(addr, has_entry, &next);
+    if (st != M68KI_OK) {
+        fprintf(stderr, "[dispatch][RAM] unrunnable RAM code from $%06X status=%d bad_pc=$%06X bad_op=$%04X\n",
+                addr, (int)st, g_m68ki_bad_pc, g_m68ki_bad_op);
+        exit(4);
+    }
+    if (next)
+        recomp_tail_call(next);
+    return 1;
+}
 
 int recomp_exact_rom_resume(uint32_t addr, int (*has_entry)(uint32_t))
 {

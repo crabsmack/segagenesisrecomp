@@ -255,6 +255,11 @@ void cosim_checkpoint(void);        /* hash + park; advances g_cosim_next_cp    
  * data-dependent cost; XSR requests an interrupt check after an SR write. */
 extern uint32_t g_xclk, g_xstart, g_xend, g_xpc;
 extern uint32_t g_xrts;    /* where the last RTS returned (68000 stack), exact mode */
+/* The 68000 PC's top byte (as bits 24-31), exact mode. The bus ignores it, but the PC keeps
+ * it: a JMP/JSR through a pointer with a tag byte, an RTS/RTE popping one, or an exception
+ * vector sets it, PC-relative branches keep it, and every pushed return address and
+ * PC-relative LEA/PEA carries it, as on the reference (Musashi never masks the PC). */
+extern uint32_t g_pchi;
 /* Returns nobody waits for. A call site waits for its own return address
  * (XCALL_BEGIN/XCALL_END around the call) and consumes a matching RTS
  * (XRTS_TAKEN). An RTS that lands where no enclosing site waits, e.g. a
@@ -281,6 +286,9 @@ void x68k_rte(void);
  * it, mid-function): run it on the exact interpreter until an address generated code can be
  * entered at (has_entry), then tail-dispatch that. 1 = handled. */
 int recomp_exact_rom_resume(uint32_t addr, int (*has_entry)(uint32_t));
+/* Exact mode, a dispatch to RAM code: the exact interpreter from addr until ROM code generated
+ * code can be entered at (has_entry), then tail-dispatch that. 1 = handled. */
+int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t));
 extern uint32_t g_xa7min;  /* lowest A7 at any instruction boundary (sync CRC dead stack) */
 extern uint64_t g_xinsn;   /* instructions started (logical positions: interrupt since) */
 extern int      g_xtrace;

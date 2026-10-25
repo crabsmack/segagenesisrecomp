@@ -27,6 +27,7 @@ uint32_t g_xstart = 0;     /* 68000 time at the start of the current instruction
 uint32_t g_xend   = 0;     /* boundary trigger: s_end, or 0 to force a check    */
 uint32_t g_xpc    = 0;     /* address of the current instruction               */
 uint32_t g_xrts   = 0;     /* 68000 return target of the last RTS               */
+uint32_t g_pchi   = 0;     /* the PC's top byte (genesis_runtime.h)             */
 uint32_t g_xa7min = 0xFFFFFFFFu; /* lowest A7 at any instruction boundary       */
 int      g_xtrace = 0;
 
@@ -53,6 +54,7 @@ int g_xabort;             /* genesis_runtime.h */
 
 void x68k_rte(void)
 {
+    if (g_exact) g_pchi = g_cpu.PC & 0xFF000000u;
     if (!g_exact || s_irq_depth > 0) {
         g_rte_pending = 1;
         return;
@@ -239,9 +241,10 @@ static void take_interrupt(uint32_t pc, unsigned level)
     g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0700u) | (level << 8));
     irq_ack(level);
     g_xirq_taken++;
-    uint32_t vec = m68k_read32((24u + level) * 4u) & 0xFFFFFFu;
-    g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], pc & 0xFFFFFFu);
+    uint32_t vraw = m68k_read32((24u + level) * 4u), vec = vraw & 0xFFFFFFu;
+    g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], (pc & 0xFFFFFFu) | g_pchi);
     g_cpu.A[7] -= 2; m68k_write16(g_cpu.A[7], sr);
+    g_pchi = vraw & 0xFF000000u;
     g_xclk += 44u * MCLK_68K;
 
     int saved_rte = g_rte_pending;
@@ -685,12 +688,16 @@ static void vdp_ctrl_w(uint16_t data)
         else                           s_pending = (uint8_t)(REG(1) & 4);
         v->address = (uint16_t)(s_addr_latch | (data & 0x3FFF));
         v->code = (uint8_t)((v->code & 0x3C) | ((data >> 14) & 0x03));
+        /* FIFO: a VRAM word is two byte-wide slots, CRAM/VSRAM one (the reference sets this
+           after every control write; codes 0-2 count as VRAM) */
+        s_fifo_byte_access = (v->code & 0x0F) <= 0x02;
         return;
     }
     s_pending = 0;
     s_addr_latch = (uint16_t)((data & 3) << 14);
     v->address = (uint16_t)(s_addr_latch | (v->address & 0x3FFF));
     v->code = (uint8_t)((v->code & 0x03) | ((data >> 2) & 0x3C));
+    s_fifo_byte_access = (v->code & 0x0F) <= 0x02;
     if ((v->code & 0x20) && (REG(1) & 0x10)) {
         switch (REG(23) >> 6) {
         case 2:                                   /* fill: waits for a data write */
@@ -1453,9 +1460,27 @@ static void z80_area_w8(uint32_t a, uint8_t v)
     gbus_write8(&g_machine.bus, a, v);                     /* YM2612 audio / bank */
 }
 
+/* Write watch (GENESIS_XWATCH=ADDR, a RAM byte address in hex): every 68000 write that covers
+ * it, with the frame and the writing instruction, on stderr. The reference's own write log
+ * misses exception and JSR pushes; this one sees every CPU write. */
+static int      s_xwatch_on = -1;
+static uint16_t s_xwatch;
+static void xwatch(uint32_t a, unsigned n, uint32_t v)
+{
+    if (s_xwatch_on < 0) {
+        const char *e = getenv("GENESIS_XWATCH");
+        s_xwatch_on = e && *e;
+        s_xwatch = s_xwatch_on ? (uint16_t)strtoul(e, NULL, 16) : 0;
+    }
+    if (s_xwatch_on && (uint16_t)(s_xwatch - (uint16_t)a) < n)
+        fprintf(stderr, "[xwatch] frame %llu pc $%06X wrote $%06X.%c = $%0*X\n",
+                (unsigned long long)s_frame_no, g_xpc, a, n == 1 ? 'b' : 'w', (int)n * 2, v);
+}
+
 void xbus_write16(uint32_t a, uint16_t v)
 {
     a &= 0xFFFFFFu;
+    if (a >= 0xE00000u) xwatch(a, 2, v);
     if (s_shared && a >= 0xE00000u) shared_mark(a, 2, 1);
     if (a >= 0xE00000u) { g_ram[a & 0xFFFF] = (uint8_t)(v >> 8); g_ram[(a + 1) & 0xFFFF] = (uint8_t)v; return; }
     if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 2, 2, v, NULL)) return;
@@ -1470,6 +1495,7 @@ void xbus_write16(uint32_t a, uint16_t v)
 void xbus_write8(uint32_t a, uint8_t v)
 {
     a &= 0xFFFFFFu;
+    if (a >= 0xE00000u) xwatch(a, 1, v);
     if (s_shared && a >= 0xE00000u) shared_mark(a, 1, 1);
     if (a >= 0xE00000u) { g_ram[a & 0xFFFF] = v; return; }
     if (g_xhw_hook && is_hw(a) && g_xhw_hook(a, 1, 2, v, NULL)) return;
@@ -1626,7 +1652,7 @@ static void fsync_z80_frame(void)
 /* whose file position no snapshot can rewind: a save with a log open fails.  */
 #define XS(v) { &(v), sizeof(v) }
 static const struct { void *p; size_t n; } k_exact_rb[] = {
-    XS(g_xclk), XS(g_xstart), XS(g_xend), XS(g_xpc), XS(g_xrts), XS(g_xa7min), XS(g_xirq_taken),
+    XS(g_xclk), XS(g_xstart), XS(g_xend), XS(g_xpc), XS(g_xrts), XS(g_pchi), XS(g_xa7min), XS(g_xirq_taken),
     XS(g_xirq_hold), XS(g_xtrace), XS(g_xawait), XS(g_xawait_n), XS(g_xrts_new), XS(s_irq_depth),
     XS(g_xabort), XS(s_depth), XS(s_end), XS(s_mline),
     XS(s_int_level), XS(s_irq_latency), XS(s_irq_latency_pc), XS(s_check_now),
@@ -1677,6 +1703,7 @@ void exact_reset(void)
     g_xclk = g_xstart = 40u * MCLK_68K;   /* reset exception */
     g_xend = 0;
     g_xawait_n = 0; g_xrts_new = 0;
+    g_pchi = (uint32_t)g_rom[4] << 24;   /* the reset vector's PC, all 32 bits */
     s_end = 0;
     s_mline = 0;
     s_int_level = 0; s_irq_latency = 0;

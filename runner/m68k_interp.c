@@ -207,9 +207,10 @@ static uint32_t addr_ea(const M68KInstr *ins, int ea, ExtR *er) {
         switch (reg) {
         case 0: { int16_t ext = (int16_t)er_next(er); return (uint32_t)(int32_t)ext; }
         case 1: return er_next_dword(er);
-        case 2: { uint32_t pc = ins->addr + er->bp; int16_t d16 = (int16_t)er_next(er);
+        /* PC-relative: the PC's top byte too (g_pchi, exact mode) */
+        case 2: { uint32_t pc = g_pchi + ins->addr + er->bp; int16_t d16 = (int16_t)er_next(er);
                   return (uint32_t)((int32_t)pc + (int32_t)d16); }
-        case 3: { uint32_t pc = ins->addr + er->bp; uint16_t ext = er_next(er);
+        case 3: { uint32_t pc = g_pchi + ins->addr + er->bp; uint16_t ext = er_next(er);
                   int xreg = (ext >> 12) & 7; int8_t d8 = (int8_t)(ext & 0xFF);
                   uint32_t xv = m68k_brief_index_value(ext, g_cpu.D[xreg], g_cpu.A[xreg]);
                   return (uint32_t)(pc + xv + (int32_t)d8); }
@@ -928,7 +929,7 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
         return M68KI_OK;
     case MN_BSR:
         discover(ins->target_addr);
-        push32(fall);
+        push32(fall | g_pchi);
         *next_pc = ins->target_addr;
         return M68KI_OK;
     case MN_DBcc: {
@@ -942,27 +943,32 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
     }
     case MN_JMP:
         *next_pc = addr_ea(ins, ins->src_ea, &er);
+        if (g_exact) g_pchi = *next_pc & 0xFF000000u;
         discover(*next_pc);
         return M68KI_OK;
     case MN_JSR: {
         uint32_t tgt = addr_ea(ins, ins->src_ea, &er);
         discover(tgt);
-        push32(fall);
+        push32(fall | g_pchi);
+        if (g_exact) g_pchi = tgt & 0xFF000000u;
         *next_pc = tgt;
         return M68KI_OK;
     }
     case MN_RTS:
         *next_pc = pop32();
+        if (g_exact) g_pchi = *next_pc & 0xFF000000u;
         return M68KI_OK;
     case MN_RTR: {                       /* pop CCR (word), then PC (long) */
         uint16_t ccr = pop16();
         g_cpu.SR = (uint16_t)((g_cpu.SR & 0xFF00u) | (ccr & 0xFFu));
         *next_pc = pop32();
+        if (g_exact) g_pchi = *next_pc & 0xFF000000u;
         return M68KI_OK;
     }
     case MN_RTE: {                       /* pop SR (word), then PC (long) */
         g_cpu.SR = pop16() & 0xA71Fu;     /* mask to valid SR bits (T,S,I,CCR) */
         *next_pc = pop32();
+        if (g_exact) g_pchi = *next_pc & 0xFF000000u;
         return M68KI_OK;
     }
 
@@ -1610,6 +1616,37 @@ M68kiStatus m68k_interp_run_handler(uint32_t entry_pc) {
  * With is_entry (ROM code no generated function can be entered at, e.g. a task the game
  * resumes where an interrupt parked it): stop before any later instruction generated code
  * can be entered at, leaving it in *out_next for the dispatcher. */
+/* GENESIS_INTERP_HIST=1: at exit, the instructions the exact interpreter ran most, by entry
+ * (where the interpreter was entered) and by PC, on stderr: what a phase-2 ruling on
+ * interpreted code is about, and which labels would hand it to generated code. */
+static uint32_t *s_ihist_pc, *s_ihist_entry;
+static int s_ihist_on = -1;
+static void ihist_top(const char *what, const uint32_t *h)
+{
+    fprintf(stderr, "[interp] top %s:", what);
+    for (int k = 0; k < 12; k++) {
+        uint32_t best = 0, bi = 0;
+        for (uint32_t i = 0; i < 0x800000u; i++) if (h[i] > best) { best = h[i]; bi = i; }
+        if (!best) break;
+        fprintf(stderr, " $%06X=%u", bi * 2u, best);
+        ((uint32_t *)h)[bi] = 0;
+    }
+    fprintf(stderr, "\n");
+}
+static void ihist_dump(void) { ihist_top("entries", s_ihist_entry); ihist_top("pcs", s_ihist_pc); }
+static void ihist_note(uint32_t entry, uint32_t pc)
+{
+    if (s_ihist_on < 0) {
+        const char *e = getenv("GENESIS_INTERP_HIST");
+        s_ihist_on = e && *e && *e != '0';
+        if (s_ihist_on) {
+            s_ihist_pc = calloc(0x800000u, 4); s_ihist_entry = calloc(0x800000u, 4);
+            if (!s_ihist_pc || !s_ihist_entry) s_ihist_on = 0; else atexit(ihist_dump);
+        }
+    }
+    if (s_ihist_on) { s_ihist_pc[(pc & 0xFFFFFFu) >> 1]++; s_ihist_entry[(entry & 0xFFFFFFu) >> 1]++; }
+}
+
 static M68kiStatus run_exact(uint32_t entry_pc, uint32_t *out_exit_pc,
                              int (*is_entry)(uint32_t), uint32_t *out_next)
 {
@@ -1639,6 +1676,7 @@ static M68kiStatus run_exact(uint32_t entry_pc, uint32_t *out_exit_pc,
         }
         if (X_TIMED) XI_CHARGE(pc, 7u * (uint32_t)m68k_cycles_exact(&ins));
         ++g_m68ki_insn_total; ++g_m68ki_insn_count;
+        if (s_ihist_on) ihist_note(entry_pc, pc);
 
         if (ins.mnemonic == MN_RTE) {
             g_cpu.SR = (uint16_t)m68k_read16(g_cpu.A[7]); g_cpu.A[7] += 2;
@@ -1652,7 +1690,9 @@ static M68kiStatus run_exact(uint32_t entry_pc, uint32_t *out_exit_pc,
                 uint16_t ccr = pop16();
                 g_cpu.SR = (uint16_t)((g_cpu.SR & 0xFF00u) | (ccr & 0xFFu));
             }
-            g_xrts = pop32() & 0xFFFFFFu;
+            uint32_t ret = pop32();
+            g_pchi = ret & 0xFF000000u;
+            g_xrts = ret & 0xFFFFFFu;
             g_xrts_new = 1;
             g_cpu.PC = g_xrts;
             if (out_exit_pc) *out_exit_pc = g_xrts;
