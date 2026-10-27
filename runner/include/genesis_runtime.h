@@ -349,6 +349,8 @@ extern uint64_t g_xirq_taken;
 /* While set, an SR write requests no interrupt check: a shadow test's untimed C run (game verify)
  * must not take an interrupt that fell due during the generated run it is compared with. */
 extern int g_xirq_hold;
+/* Set for an interrupt vector's dispatch (take_interrupt): the call-site log skips it. */
+extern int g_xirq_dispatch;
 #define XC(c) (g_xclk += (uint32_t)(int32_t)(c))
 #define XSR() x68k_sr_written()
 /* Untimed code (stepped runner): before an instruction writes SR, so a logged interrupt due

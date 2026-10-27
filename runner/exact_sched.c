@@ -287,6 +287,7 @@ static void take_interrupt(uint32_t pc, unsigned level)
     g_split_sp_popped = 0;
     pos_irq_enter(level);
     s_irq_depth++;
+    g_xirq_dispatch = 1;   /* the vector's dispatch is no jsr's (glue.c's call-site log) */
     recomp_call_addr(vec);
     s_irq_depth--;
     pos_irq_leave();

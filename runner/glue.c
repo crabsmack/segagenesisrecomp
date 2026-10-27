@@ -483,6 +483,7 @@ void recomp_exact_ram_resume(uint32_t pc) { ram_interp(pc & 0xFFFFFFu, 1); }
  * at function entries misses. Hand-written 68000 has no calling convention: a function reached
  * only this way gets its outputs from what these sources read after the return (dkit disasm regs). */
 #define CS_SLOTS (1u << 16)
+int g_xirq_dispatch;   /* set by take_interrupt (exact_sched.c) for its vector's dispatch */
 static uint32_t s_cs_src[CS_SLOTS], s_cs_dst[CS_SLOTS];
 static uint64_t s_cs_n[CS_SLOTS];
 static int s_cs_on = -1;
@@ -502,6 +503,10 @@ static void callsites_log(uint32_t addr)
         const char *e = getenv("GENESIS_CALLSITES_OUT");
         s_cs_on = e && *e;
         if (s_cs_on) atexit(callsites_dump);
+    }
+    if (g_xirq_dispatch) {   /* an interrupt's vector dispatch: the interrupted jsr didn't make it */
+        g_xirq_dispatch = 0;
+        return;
     }
     if (!s_cs_on) return;
     uint32_t pc = g_xpc & 0xFFFFFFu;
