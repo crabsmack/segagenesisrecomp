@@ -71,6 +71,10 @@ M68kiStatus m68k_interp_run_ram_handler(uint32_t entry_pc, uint32_t *out_exit_pc
 /* Exact mode: run ROM code from pc (no generated entry there) until the next instruction
  * generated code can be entered at (*out_next), or until it returns or switches away (0). */
 M68kiStatus m68k_interp_run_exact_until(uint32_t pc, int (*is_entry)(uint32_t), uint32_t *out_next);
+/* The same, from an instruction whose boundary generated code already ran (a RAM code
+ * overlay handing over mid-way): pc's instruction is decoded and charged without a second
+ * boundary, as if the interpreter had run that boundary itself. */
+M68kiStatus m68k_interp_resume_exact_until(uint32_t pc, int (*is_entry)(uint32_t), uint32_t *out_next);
 
 /*
  * Execute exactly one instruction at g_cpu.PC and advance g_cpu.PC. Used by

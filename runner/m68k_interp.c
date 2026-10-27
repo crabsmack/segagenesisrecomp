@@ -1648,7 +1648,7 @@ static void ihist_note(uint32_t entry, uint32_t pc)
 }
 
 static M68kiStatus run_exact(uint32_t entry_pc, uint32_t *out_exit_pc,
-                             int (*is_entry)(uint32_t), uint32_t *out_next)
+                             int (*is_entry)(uint32_t), uint32_t *out_next, int past_boundary)
 {
     g_cpu.PC = entry_pc & 0xFFFFFFu;
     g_m68ki_insn_count = 0;
@@ -1664,7 +1664,9 @@ static M68kiStatus run_exact(uint32_t entry_pc, uint32_t *out_exit_pc,
             *out_next = pc;
             return M68KI_OK;
         }
-        if (X_TIMED && g_xclk >= g_xend) {    /* XI_BOUNDARY */
+        if (past_boundary)                    /* the caller ran this instruction's boundary */
+            past_boundary = 0;
+        else if (X_TIMED && g_xclk >= g_xend) {    /* XI_BOUNDARY */
             x68k_slice(pc);
             if (g_xabort) { g_xabort = 0; return M68KI_OK; }   /* a task switch abandoned this code */
         }
@@ -1725,7 +1727,16 @@ M68kiStatus m68k_interp_run_exact_until(uint32_t pc, int (*is_entry)(uint32_t), 
 {
     int saved = s_xmode;
     s_xmode = g_game_spec.stepped ? 2 : 1;
-    M68kiStatus st = run_exact(pc, NULL, is_entry, out_next);
+    M68kiStatus st = run_exact(pc, NULL, is_entry, out_next, 0);
+    s_xmode = saved;
+    return st;
+}
+
+M68kiStatus m68k_interp_resume_exact_until(uint32_t pc, int (*is_entry)(uint32_t), uint32_t *out_next)
+{
+    int saved = s_xmode;
+    s_xmode = g_game_spec.stepped ? 2 : 1;
+    M68kiStatus st = run_exact(pc, NULL, is_entry, out_next, 1);
     s_xmode = saved;
     return st;
 }
@@ -1735,7 +1746,7 @@ M68kiStatus m68k_interp_run_ram_handler(uint32_t entry_pc, uint32_t *out_exit_pc
     if (g_exact) {
         int saved = s_xmode;
         s_xmode = g_game_spec.stepped ? 2 : 1;
-        M68kiStatus st = run_exact(entry_pc, out_exit_pc, NULL, NULL);
+        M68kiStatus st = run_exact(entry_pc, out_exit_pc, NULL, NULL, 0);
         s_xmode = saved;
         return st;
     }

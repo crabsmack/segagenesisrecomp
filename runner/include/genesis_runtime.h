@@ -286,9 +286,28 @@ void x68k_rte(void);
  * it, mid-function): run it on the exact interpreter until an address generated code can be
  * entered at (has_entry), then tail-dispatch that. 1 = handled. */
 int recomp_exact_rom_resume(uint32_t addr, int (*has_entry)(uint32_t));
-/* Exact mode, a dispatch to RAM code: the exact interpreter from addr until ROM code generated
- * code can be entered at (has_entry), then tail-dispatch that. 1 = handled. */
+/* Exact mode, a dispatch to RAM code: a RAM code overlay whose template work RAM holds (below),
+ * else the exact interpreter from addr until ROM code generated code can be entered at
+ * (has_entry), then tail-dispatch that. 1 = handled. */
 int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t));
+/* RAM code overlays (game.toml [[ram_code]]; the generated dispatch TU defines the table):
+ * code the game runs from work RAM, generated at its RAM address. It runs when RAM holds
+ * `bytes` at every byte that is not `live` (rewritten at run time, read when it executes).
+ * Each generated instruction is the interpreter's: its boundary, then (after a slice, or a
+ * write that may have hit the template) the template check again, then its exact cost. */
+typedef struct {
+    uint32_t       addr;
+    uint32_t       len;
+    const uint8_t *bytes;
+    const uint8_t *live;     /* 1 = not compared */
+    void         (*fn)(void);
+} RecompRamCode;
+extern const RecompRamCode g_recomp_ram_code[];
+extern const int           g_recomp_ram_code_count;
+int  recomp_ram_code_matches(const RecompRamCode *rc);
+/* An overlay that can no longer run as generated (the template changed under it, a live
+ * branch went somewhere else): the exact interpreter from pc, which is past its boundary. */
+void recomp_exact_ram_resume(uint32_t pc);
 extern uint32_t g_xa7min;  /* lowest A7 at any instruction boundary (sync CRC dead stack) */
 extern uint64_t g_xinsn;   /* instructions started (logical positions: interrupt since) */
 extern int      g_xtrace;

@@ -177,6 +177,38 @@ typedef struct {
 } GameRamLayoutCfg;
 
 /*
+ * RAM code overlay, from [[ram_code]] in game.toml: code the game copies (or
+ * writes) into work RAM and runs there, e.g. an H-int handler. The recompiler
+ * generates it as a function decoded at its RAM address (exact mode only);
+ * the runner runs that function when work RAM holds the template (every byte
+ * outside `live` equal), and the exact interpreter otherwise.
+ *
+ *     [[ram_code]]
+ *     addr   = 0xFFE560          # where the code runs
+ *     source = 0x00B20C          # template: ROM bytes the game copies...
+ *     bytes  = [0x4E, 0xF9]      # ...or the bytes themselves (stubs it writes)
+ *     length = 0x26              # bytes compared and decoded (from addr)
+ *     live   = [{ start = 0xFFE562, end = 0xFFE564 }]   # [start, end): rewritten at run time
+ *
+ * A live byte is read from RAM when the instruction holding it runs. Supported
+ * live fields: absolute-address extension words (abs.W / abs.L, any operand),
+ * including a JMP abs.L target, and a Bcc.S displacement (a switch over the
+ * template's instruction starts; any other value runs on the interpreter).
+ * Anything else live is a generation error.
+ */
+#define GAMECFG_RAM_CODE_MAX_LEN 256
+
+typedef struct {
+    uint32_t addr;                                /* RAM address (24-bit)           */
+    uint32_t len;                                 /* template bytes                 */
+    uint32_t source;                              /* ROM source of the bytes        */
+    bool     has_source;                          /* else bytes[] came from `bytes` */
+    uint8_t  bytes[GAMECFG_RAM_CODE_MAX_LEN];     /* template (filled at codegen
+                                                   * from the ROM when has_source)  */
+    uint8_t  live[GAMECFG_RAM_CODE_MAX_LEN];      /* 1 = rewritten at run time      */
+} GameRamCode;
+
+/*
  * GameConfig — every list grows on demand. After game_config_load,
  * the arrays are owned by the cfg; call game_config_free to release
  * them (or just leak them at process exit, which is what the CLI
@@ -302,6 +334,10 @@ typedef struct {
     WsSite         *ws_sites;
     int            ws_site_count;
     int            ws_site_cap;
+    /* RAM code overlays, from [[ram_code]] (see GameRamCode). */
+    GameRamCode    *ram_code;
+    int            ram_code_count;
+    int            ram_code_cap;
     GameRamLayoutCfg ram_layout;
 } GameConfig;
 

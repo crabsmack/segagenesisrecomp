@@ -448,14 +448,24 @@ static int s_in_vblank_service = 0;
  * resolution: a RAM `jmp handler`, e.g. an H-int vector's stub, costs its 12 cycles and is an
  * instruction like any other), until ROM code generated code can be entered at, then
  * tail-dispatch that. A return or RTE in the RAM code ends it the hardware way (g_xrts,
- * g_rte_pending). 1 = handled. */
-int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t))
+ * g_rte_pending). 1 = handled.
+ * A RAM code overlay (game.toml [[ram_code]]) whose template RAM holds runs instead, as
+ * generated code; GENESIS_NO_RAM_OVERLAYS=1 turns them off (the interpreter runs it all). */
+static int (*s_ram_has_entry)(uint32_t);
+
+int recomp_ram_code_matches(const RecompRamCode *rc)
 {
-    addr &= 0xFFFFFFu;
-    if (!g_exact || addr < RAM_BASE)
-        return 0;
+    for (uint32_t i = 0; i < rc->len; i++)
+        if (!rc->live[i] && g_ram[(rc->addr + i) & 0xFFFFu] != rc->bytes[i])
+            return 0;
+    return 1;
+}
+
+static void ram_interp(uint32_t addr, int resume)
+{
     uint32_t next = 0;
-    M68kiStatus st = m68k_interp_run_exact_until(addr, has_entry, &next);
+    M68kiStatus st = resume ? m68k_interp_resume_exact_until(addr, s_ram_has_entry, &next)
+                            : m68k_interp_run_exact_until(addr, s_ram_has_entry, &next);
     if (st != M68KI_OK) {
         fprintf(stderr, "[dispatch][RAM] unrunnable RAM code from $%06X status=%d bad_pc=$%06X bad_op=$%04X\n",
                 addr, (int)st, g_m68ki_bad_pc, g_m68ki_bad_op);
@@ -463,6 +473,28 @@ int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t))
     }
     if (next)
         recomp_tail_call(next);
+}
+
+void recomp_exact_ram_resume(uint32_t pc) { ram_interp(pc & 0xFFFFFFu, 1); }
+
+int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t))
+{
+    static int s_overlays = -1;
+    addr &= 0xFFFFFFu;
+    if (!g_exact || addr < RAM_BASE)
+        return 0;
+    s_ram_has_entry = has_entry;
+    if (s_overlays < 0) {
+        const char *e = getenv("GENESIS_NO_RAM_OVERLAYS");
+        s_overlays = !(e && *e && *e != '0');
+    }
+    if (s_overlays && !g_game_spec.stepped)
+        for (int i = 0; i < g_recomp_ram_code_count; i++)
+            if (g_recomp_ram_code[i].addr == addr && recomp_ram_code_matches(&g_recomp_ram_code[i])) {
+                g_recomp_ram_code[i].fn();
+                return 1;
+            }
+    ram_interp(addr, 0);
     return 1;
 }
 
