@@ -1091,6 +1091,10 @@ static void rp_next(void)
 }
 
 static uint32_t s_last_entry;          /* last game function entered (diagnostics) */
+/* volatile reads for a watchdog thread: a stepped run spinning on a RAM flag makes no hardware
+   read (the hang guard's count) and enters no function, so only time tells it is stuck */
+uint32_t x68k_last_entry(void) { return *(volatile uint32_t *)&s_last_entry; }
+uint64_t x68k_sync_count(void) { return *(volatile uint64_t *)&s_sync_no; }
 static void rp_divergence(const char *what)
 {
     fprintf(stderr, "[replay] divergence at record %llu (%c): %s; position depth %d entries %llu reads %u, "

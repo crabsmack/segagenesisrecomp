@@ -358,6 +358,9 @@ void x68k_sr_pre(void);
 /* The frame-synchronous stepped runner takes the V-int now (a wait for it with no sync point);
    any other runner: nothing (exact_sched.c). */
 void x68k_wait_vint(uint32_t pc);
+/* Diagnostics for a watchdog (another thread): the last game function entered, sync points so far. */
+uint32_t x68k_last_entry(void);
+uint64_t x68k_sync_count(void);
 
 /* Operand-dependent MUL/DIV time in master clocks (the standard 68000 timing
  * algorithms: MULU 38+2n for n set bits, MULS 38+2n for n 01/10 pairs, DIVU
