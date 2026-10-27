@@ -1192,6 +1192,7 @@ static void pos_irq_leave(void)
 
 static void fsync_vint(void);
 static void fsync_z80_frame(void);
+static uint64_t s_fs_reads;
 
 /* The frame-synchronous runner's picture: the whole frame from the VDP as the V-int handler left
    it, which is what the active display shows (minus mid-frame raster changes: no H-int here, and
@@ -1228,9 +1229,13 @@ static void sync_point(void)
     }
     if (g_game_spec.on_sync) g_game_spec.on_sync(s_sync_no, frame);
     if (s_stepped) glue_exact_park();          /* one runner frame per sync interval */
-    if (s_fsync) {                             /* frame-synchronous: the V-int is taken here */
-        fsync_vint();
-        fsync_render();
+    if (s_fsync) {                             /* frame-synchronous: the V-int is taken here, */
+        if (g_game_spec.fsync_vint_at_wait) {  /* or at the game's wait for it (rendered there) */
+            s_fs_reads = 0;
+        } else {
+            fsync_vint();
+            fsync_render();
+        }
     }
 }
 
@@ -1302,7 +1307,7 @@ static uint16_t hw_read(uint32_t a, uint8_t size)
  * only on the program's own hardware accesses, so a function in C and its generated version
  * see the same machine. */
 static int s_fs_vblank;              /* the VDP status shows VBLANK (after one clear read)     */
-static uint64_t s_fs_reads;          /* hardware reads since the last sync point (hang guard)  */
+/* s_fs_reads (above sync_point): hardware reads since the last sync point (hang guard) */
 
 static void fsync_vint(void)
 {
@@ -1315,11 +1320,18 @@ static void fsync_vint(void)
    V-int handler sets (X-Men 2's two-player half-rate wait, before VDP_WaitVBlank). A timed run
    gets the V-int mid-frame; the frame-synchronous one takes it only at sync points, so the
    game calls this from the wait (a game_hook site, or the hand C's IRQ_WAIT) and the V-int is
-   taken now. Elsewhere a no-op. */
+   taken now. Elsewhere a no-op. With GameSpec.fsync_vint_at_wait this is the frame's only
+   V-int, so the picture is rendered after it. */
 void x68k_wait_vint(uint32_t pc)
 {
     if (!s_fsync) return;
-    if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) take_interrupt(pc, 6);
+    if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) {
+        take_interrupt(pc, 6);
+        if (g_game_spec.fsync_vint_at_wait) {
+            s_fs_vblank = 0;
+            fsync_render();
+        }
+    }
 }
 
 

@@ -327,7 +327,9 @@ void x68k_divide_by_zero(uint32_t next_pc);
 extern int g_xabort;
 #define XI_CHARGE(pc, c) do { g_xpc = (pc); \
     g_xstart = g_xclk; if (g_xtrace) x68k_trace(pc); g_xclk += (c); g_xinsn++; \
-    if (g_cpu.A[7] < g_xa7min) g_xa7min = g_cpu.A[7]; } while (0)
+    if (g_cpu.A[7] - 1u < g_xa7min - 1u) g_xa7min = g_cpu.A[7]; } while (0)
+/* (A7 - 1: an A7 of 0 is the top of the stack, not its lowest point. A reset SSP of 0 puts the
+ * stack at the end of RAM, and the first push wraps it to $FFFFFFFC.) */
 /* game.toml entry_hooks: a game function entered at its own start (a call of
  * func_ADDR). Counts logical positions (sync points, replay; exact_sched.c).
  * Nonzero = the body already ran (a verification harness ran it): return. */

@@ -214,6 +214,12 @@ typedef struct GameSpec {
     uint32_t        sync_pc;
     void          (*on_sync)(uint64_t sync, uint64_t frame);
     int             stepped;
+    /* Frame-synchronous runner only: 1 = the V-int is NOT taken at sync points,
+     * only where the game waits for it (x68k_wait_vint). For a game whose sync
+     * point comes before it releases the frame to the V-int (its frame-end
+     * routine's entry, while a busy flag still sends the V-int down its lag
+     * path), so the wait is where the full V-int belongs. 0 = X-Men 2's rule. */
+    int             fsync_vint_at_wait;
     /* Every XENTRY (any function, after the position bookkeeping). Return nonzero
      * when the hook ran the function's body itself (a verification harness): the
      * generated wrapper then returns at once. NULL = 0. */
