@@ -477,10 +477,53 @@ static void ram_interp(uint32_t addr, int resume)
 
 void recomp_exact_ram_resume(uint32_t pc) { ram_interp(pc & 0xFFFFFFu, 1); }
 
+/* GENESIS_CALLSITES_OUT=path (exact mode, diagnostics): every computed jsr/jmp the game makes,
+ * `SRC TARGET COUNT` lines at exit. Every dispatch comes through recomp_exact_ram_run first, so the
+ * targets include interior labels (a script's next op, an unrolled copy's entry), which a log
+ * at function entries misses. Hand-written 68000 has no calling convention: a function reached
+ * only this way gets its outputs from what these sources read after the return (dkit disasm regs). */
+#define CS_SLOTS (1u << 16)
+static uint32_t s_cs_src[CS_SLOTS], s_cs_dst[CS_SLOTS];
+static uint64_t s_cs_n[CS_SLOTS];
+static int s_cs_on = -1;
+extern uint8_t g_rom[0x400000];
+static void callsites_dump(void)
+{
+    FILE *f = fopen(getenv("GENESIS_CALLSITES_OUT"), "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < CS_SLOTS; i++)
+        if (s_cs_n[i]) fprintf(f, "%06X %06X %llu\n", (unsigned)s_cs_src[i], (unsigned)s_cs_dst[i],
+                               (unsigned long long)s_cs_n[i]);
+    fclose(f);
+}
+static void callsites_log(uint32_t addr)
+{
+    if (s_cs_on < 0) {
+        const char *e = getenv("GENESIS_CALLSITES_OUT");
+        s_cs_on = e && *e;
+        if (s_cs_on) atexit(callsites_dump);
+    }
+    if (!s_cs_on) return;
+    uint32_t pc = g_xpc & 0xFFFFFFu;
+    if (pc + 1 >= 0x400000u) return;
+    uint16_t op = (uint16_t)((g_rom[pc] << 8) | g_rom[pc + 1]);
+    unsigned mode = (op >> 3) & 7, reg = op & 7;
+    /* jsr / jmp through a register or a pc-relative index (abs.w, abs.l and d16(pc) are static) */
+    if ((op & 0xFF80u) != 0x4E80u || (mode != 2 && mode != 5 && mode != 6 && !(mode == 7 && reg == 3)))
+        return;
+    for (uint32_t h = ((pc * 2654435761u) ^ (addr * 40503u)) & (CS_SLOTS - 1u), k = 0; k < CS_SLOTS;
+         k++, h = (h + 1u) & (CS_SLOTS - 1u)) {
+        if (s_cs_n[h] && (s_cs_src[h] != pc || s_cs_dst[h] != addr)) continue;
+        s_cs_src[h] = pc; s_cs_dst[h] = addr; s_cs_n[h]++;
+        return;
+    }
+}
+
 int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t))
 {
     static int s_overlays = -1;
     addr &= 0xFFFFFFu;
+    callsites_log(addr);
     if (!g_exact || addr < RAM_BASE)
         return 0;
     s_ram_has_entry = has_entry;

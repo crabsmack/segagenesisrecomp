@@ -78,6 +78,12 @@ void input_script_tick(uint64_t frame,
 uint16_t input_script_held_mask(void);
 uint16_t input_script_player_mask(int player);
 bool input_script_player_used(int player);
+/* The current frame's VPAD queue (frame-synchronous runners: the pads of the further reference
+ * frames this logical frame spans, one per V-int the game waits for; player 0 or 1). */
+uint32_t input_script_vpad_count(void);
+uint16_t input_script_vpad(uint32_t i, int player);
+/* The n-th reference frame's pads after the current frame's queue, read ahead in the script. */
+uint16_t input_script_peek(uint32_t n, int player);
 
 /* True iff the script ran an EXIT directive. The caller should
  * cleanly tear down (close TCP server, flush logs, exit). */

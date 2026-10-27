@@ -45,6 +45,7 @@ typedef enum {
     OP_DUMP_RAM,
     OP_DUMP_VRAM,
     OP_EXIT,
+    OP_VPAD,           /* one more frame's pads for this frame's queue (frame-synchronous runners) */
 } OpCode;
 
 typedef struct {
@@ -82,6 +83,14 @@ static char     s_pending_vram_dump[260];
 
 /* One deadline per button/player: presses cannot exhaust a small timer pool. */
 static uint64_t s_press_until[SCRIPT_PLAYERS][SCRIPT_BUTTONS];
+
+/* VPAD p1 p2 directives of the current frame, in order: a frame-synchronous runner plays one
+ * runner frame per logical frame of the game, and a frame that spans several reference frames
+ * (a pause loop polling the pads the V-int refreshes) gets their pads one per V-int it waits for
+ * (the game's spec takes them: input_script_vpad). Emptied at every tick. */
+static uint16_t *s_vq;
+static uint32_t  s_vq_n, s_vq_cap;
+static uint64_t  s_tick_frame;   /* the frame of the last tick (input_script_peek) */
 
 /* ---- Button name parsing ---- */
 
@@ -153,6 +162,18 @@ static int parse_line(char *line, int line_no) {
             if (*e || v > 0xFFFu) goto bad;
             o->pads[i] = (uint16_t)v;
             s_players_used[i] = 1;
+        }
+    } else if (!_stricmp(tok, "VPAD")) {
+        /* VPAD <p1> [<p2>]: hex masks, appended to the frame's queue */
+        char pv[2][32];
+        int np = sscanf(p, "%63s %31s %31s", tok, pv[0], pv[1]) - 1;
+        if (np < 1) goto bad;
+        o->op = OP_VPAD;
+        for (int i = 0; i < 2; i++) {
+            char *e;
+            unsigned long v = i < np ? strtoul(pv[i], &e, 16) : 0;
+            if ((i < np && *e) || v > 0xFFFu) goto bad;
+            o->pads[i] = (uint16_t)v;
         }
     } else if (!_stricmp(tok, "WAIT") && n >= 2) {
         o->op    = OP_WAIT;
@@ -269,6 +290,9 @@ void input_script_tick(uint64_t frame,
 {
     if (!s_active) return;
 
+    s_vq_n = 0;   /* a frame's VPAD queue is its own */
+    s_tick_frame = frame;
+
     /* Auto-release any PRESS that has timed out. */
     for (unsigned p = 0; p < SCRIPT_PLAYERS; ++p) {
         for (unsigned b = 0; b < SCRIPT_BUTTONS; ++b) {
@@ -290,6 +314,20 @@ void input_script_tick(uint64_t frame,
                 s_wait_until_frame = frame + o->arg32;
                 s_pc++;
                 if (frame < s_wait_until_frame) return;
+                break;
+
+            case OP_VPAD:
+                if (s_vq_n == s_vq_cap) {
+                    uint32_t cap = s_vq_cap ? s_vq_cap * 2 : 64;
+                    uint16_t *g = (uint16_t *)realloc(s_vq, (size_t)cap * 2 * sizeof *g);
+                    if (!g) { s_pc++; break; }
+                    s_vq = g;
+                    s_vq_cap = cap;
+                }
+                s_vq[2 * s_vq_n] = o->pads[0];
+                s_vq[2 * s_vq_n + 1] = o->pads[1];
+                s_vq_n++;
+                s_pc++;
                 break;
 
             case OP_PADS:
@@ -433,6 +471,57 @@ void input_script_tick(uint64_t frame,
                 return;
         }
     }
+}
+
+uint32_t input_script_vpad_count(void) { return s_vq_n; }
+uint16_t input_script_vpad(uint32_t i, int player)
+{
+    return i < s_vq_n && player >= 0 && player < 2 ? s_vq[2 * i + (uint32_t)player] : 0;
+}
+
+/* The pads of the n-th reference frame after the current frame's own (its first and its VPAD
+ * queue), reading the script ahead without running it: the rest of the current WAIT, then each
+ * later group `PADS x [VPAD a ...] WAIT w` as the frames x, a, ... (with VPADs) or x w times.
+ * For a frame-synchronous run whose logical frame outlasts the reference's (a pause the
+ * reference never made, after the two diverged): its waits go on taking input instead of
+ * spinning on the last pads for ever. 0 past the script's end. */
+uint16_t input_script_peek(uint32_t n, int player)
+{
+    if (player < 0 || player >= 2) return 0;
+    uint16_t held = s_held_mask[player];
+    uint64_t rest = s_wait_until_frame > s_tick_frame + 1 ? s_wait_until_frame - s_tick_frame - 1 : 0;
+    if (n < rest) return held;
+    n -= (uint32_t)rest;
+    int first_pending = 0;
+    for (int pc = s_pc; pc < s_op_count; pc++) {
+        const ScriptOp *o = &s_ops[pc];
+        switch (o->op) {
+        case OP_PADS:
+            if ((uint32_t)player < o->arg32) held = o->pads[player];
+            first_pending = 1;
+            break;
+        case OP_VPAD:
+            if (first_pending) {
+                if (n == 0) return held;
+                n--;
+                first_pending = 0;
+            }
+            if (n == 0) return o->pads[player];
+            n--;
+            break;
+        case OP_WAIT: {
+            uint32_t w = o->arg32 ? o->arg32 : 1;
+            uint32_t k = first_pending ? w : w - 1;
+            if (n < k) return held;
+            n -= k;
+            first_pending = 1;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return 0;
 }
 
 uint16_t input_script_player_mask(int player) {

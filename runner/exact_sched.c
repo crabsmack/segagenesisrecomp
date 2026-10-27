@@ -232,10 +232,44 @@ static void set_irq_delay(unsigned level)
     force_boundary();
 }
 
+/* GENESIS_IRQPC_OUT=path (diagnostics): how often each main-program PC was interrupted by the
+ * V-int, `PC COUNT` lines at exit. A PC the V-int lands on frame after frame is a loop waiting for
+ * it: the frame-synchronous runner's wait sites (it takes the V-int only where told). */
+#define IRQPC_SLOTS (1u << 14)
+static uint32_t s_irqpc_pc[IRQPC_SLOTS];
+static uint64_t s_irqpc_n[IRQPC_SLOTS];
+static int s_irqpc_on = -1;
+static void irqpc_dump(void)
+{
+    FILE *f = fopen(getenv("GENESIS_IRQPC_OUT"), "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < IRQPC_SLOTS; i++)
+        if (s_irqpc_n[i]) fprintf(f, "%06X %llu\n", (unsigned)s_irqpc_pc[i], (unsigned long long)s_irqpc_n[i]);
+    fclose(f);
+}
+static void irqpc_count(uint32_t pc, unsigned level)
+{
+    if (s_irqpc_on < 0) {
+        const char *e = getenv("GENESIS_IRQPC_OUT");
+        s_irqpc_on = e && *e;
+        if (s_irqpc_on) atexit(irqpc_dump);
+    }
+    if (!s_irqpc_on || level != 6 || s_irq_depth) return;
+    pc &= 0xFFFFFFu;
+    for (uint32_t h = (pc * 2654435761u) & (IRQPC_SLOTS - 1u), k = 0; k < IRQPC_SLOTS;
+         k++, h = (h + 1u) & (IRQPC_SLOTS - 1u)) {
+        if (s_irqpc_n[h] && s_irqpc_pc[h] != pc) continue;
+        s_irqpc_pc[h] = pc;
+        s_irqpc_n[h]++;
+        return;
+    }
+}
+
 /* Exception processing for an autovectored interrupt at the boundary before
  * `pc`, then the handler itself, on the game fiber. */
 static void take_interrupt(uint32_t pc, unsigned level)
 {
+    irqpc_count(pc, level);
     uint16_t sr = g_cpu.SR;
     g_cpu.SR = (uint16_t)((sr & ~0x8000u) | 0x2000u);        /* S set, T clear */
     g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0700u) | (level << 8));
