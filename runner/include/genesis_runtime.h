@@ -346,6 +346,13 @@ int x68k_entry(uint32_t addr);
 extern int (*g_xhw_hook)(uint32_t addr, int size, int kind, uint16_t v, uint16_t *out);
 extern void (*g_xinsn_hook)(uint32_t pc);
 extern uint64_t g_xirq_taken;
+/* Untimed code's instruction coverage (the stepped runner): XU(pc) starts every generated
+ * instruction; while g_xcov is set (a runner allocates XCOV_BYTES), it marks the instruction's
+ * ROM word: g_xcov[pc >> 1] = 1. RAM code (pc >= XCOV_LIMIT) is not recorded. */
+#define XCOV_LIMIT 0x400000u
+#define XCOV_BYTES (XCOV_LIMIT >> 1)
+extern uint8_t *g_xcov;
+#define XU(pc) do { if (g_xcov && (uint32_t)(pc) < XCOV_LIMIT) g_xcov[(uint32_t)(pc) >> 1] = 1; } while (0)
 /* While set, an SR write requests no interrupt check: a shadow test's untimed C run (game verify)
  * must not take an interrupt that fell due during the generated run it is compared with. */
 extern int g_xirq_hold;

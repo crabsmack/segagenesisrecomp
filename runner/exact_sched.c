@@ -67,6 +67,7 @@ void x68k_rte(void)
 int  (*g_xhw_hook)(uint32_t addr, int size, int kind, uint16_t v, uint16_t *out);
 void (*g_xinsn_hook)(uint32_t pc);
 uint64_t g_xirq_taken;
+uint8_t *g_xcov;                 /* untimed code's coverage map (XU), set by the runner */
 
 /* Logical positions (see "Logical positions" below). */
 static int s_stepped;            /* GameSpec.stepped: untimed code             */
