@@ -1,6 +1,7 @@
 #include "audio.h"
 #include <SDL2/SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Shared clock-domain bridge: persistent band-limited polyphase resampler + a
@@ -224,6 +225,38 @@ void audio_flush(uint32_t wall_frame, int realtime,
 
     if (psg_frames > OUT_BUF_FRAMES)
         psg_frames = OUT_BUF_FRAMES;
+
+    /* Per-flush log (env GENESIS_AUDIO_FLUSHLOG=<path>): one row per presented frame with the
+     * emulated audio it carries (PSG-rate frames: 223,721 Hz; FM frames) and the bridge's
+     * state at entry: ring fill, its cumulative underrun / conceal (stretch) counters, the
+     * wall time since the previous flush. Measures a runner's audio delivery per frame, and
+     * when the device starved, without listening. No-op unless set. */
+    {
+        static FILE *s_fl = NULL; static int s_fl_init = 0;
+        if (!s_fl_init) {
+            s_fl_init = 1;
+            const char *p = getenv("GENESIS_AUDIO_FLUSHLOG");
+            if (p && *p && (s_fl = fopen(p, "w")) != NULL)
+                fprintf(s_fl, "frame,realtime,psg_frames,fm_frames,fill_ms,underruns,conceal_events,"
+                              "conceal_frames,overflow_drops,dt_us\n");
+        }
+        if (s_fl) {
+            static Uint64 s_fl_pc = 0;
+            Uint64 now = SDL_GetPerformanceCounter();
+            uint32_t dt = s_fl_pc ? (uint32_t)((now - s_fl_pc) * 1000000ull / SDL_GetPerformanceFrequency()) : 0;
+            s_fl_pc = now;
+            rab_stats st;
+            SDL_LockAudioDevice(s_dev);
+            rab_get_stats(&s_bridge, &st);
+            double fill = rab_fill_ms(&s_bridge);
+            SDL_UnlockAudioDevice(s_dev);
+            fprintf(s_fl, "%u,%d,%zu,%zu,%.2f,%llu,%llu,%llu,%llu,%u\n", wall_frame, realtime, psg_frames,
+                    fm_frames, fill, (unsigned long long)st.underrun_events,
+                    (unsigned long long)st.stretch_events, (unsigned long long)st.stretch_frames,
+                    (unsigned long long)st.overflow_drops, dt);
+            fflush(s_fl);
+        }
+    }
 
     /* Delivery observability: the bridge ring fill (ms) at flush entry is the
      * analogue of the old SDL-queue depth, and the bridge's own underrun

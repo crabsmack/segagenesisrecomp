@@ -534,6 +534,13 @@ static void z80_trace_one(const z80 *z, uint32_t zclk)
             (unsigned)(z->halted ? (uint16_t)(z->pc - 1) : z->pc), zclk, h);
 }
 
+/* Audio stamp of exact-mode Z80 time 0, in the coming mixer drain's master cycles (exact_sched.c
+ * sets it; output only: the machine never reads it). 0 on the timed runner, whose Z80 clock is
+ * re-based at the same moment as the drain. The frame-synchronous runner re-bases its Z80
+ * clock at the start of a runner frame, so the Z80 time its 68000's bus releases run later in
+ * that frame belongs after the frame's drain: it is stamped one Z80 frame on. */
+uint32_t g_z80_exact_stamp_base;
+
 /* Run the Z80 to master clock `target` (15 master clocks per T-state), in the
  * reference's order: a pending interrupt is taken BEFORE an instruction (not
  * in an EI shadow), then one instruction runs. */
@@ -542,7 +549,7 @@ void machine_z80_exact_step(uint32_t *zclk, uint32_t target)
     GenesisMachine *m = &g_machine;
     static int ei_shadow;
     while (*zclk < target) {
-        s_line_base = 0;
+        s_line_base = g_z80_exact_stamp_base;
         s_z80_off = *zclk;                 /* audio stamp: frame-relative master */
 #ifdef GENESIS_Z80_RECOMP
         *zclk += z80_recomp_step_one() * MASTER_PER_Z80;

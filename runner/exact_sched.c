@@ -381,6 +381,7 @@ static void m68k_run(uint32_t target)
 
 static void fm_reset_chip(uint32_t t);
 static void fm_update(uint32_t t);
+static uint32_t s_fs_releases;   /* fsync_z80_frame's log: bus releases in this interval */
 
 static void z80_run(uint32_t target)
 {
@@ -401,7 +402,10 @@ static void z80_busreq_w(int req, uint32_t now)
         s_zstate &= 1;
         /* frame-synchronous: a released Z80 runs a fixed slice, so a 68000 waiting for the
            sound driver's answer sees it after a deterministic number of polls */
-        if (s_fsync && s_zstate == 1) machine_z80_exact_step(&s_zclk, s_zclk + 8u * MPL);
+        if (s_fsync && s_zstate == 1) {
+            s_fs_releases++;
+            machine_z80_exact_step(&s_zclk, s_zclk + 8u * MPL);
+        }
     }
     g_machine.bus.z80_busreq = (uint8_t)((s_zstate & 2) ? 1 : 0);
 }
@@ -1670,14 +1674,42 @@ void exact_ym_write(uint32_t t, unsigned port, uint8_t v)
 /* ======================================================================== */
 /* Frame                                                                     */
 
+/* GENESIS_FSYNC_ZLOG=<path>: per runner frame, the Z80 time the previous interval's bus releases
+   ran (master clocks, carried into this frame) and their count. */
+static void fsync_zlog(uint32_t carried)
+{
+    static FILE *f;
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *p = getenv("GENESIS_FSYNC_ZLOG");
+        if (p && *p && (f = fopen(p, "w")) != NULL) fprintf(f, "frame,carried_master,releases\n");
+    }
+    if (f) fprintf(f, "%llu,%u,%u\n", (unsigned long long)s_frame_no, carried, s_fs_releases);
+    s_fs_releases = 0;
+}
+
+extern uint32_t g_z80_exact_stamp_base;   /* video/genesis_machine.c: the Z80's audio stamps */
+
 /* The Z80's frame: its V-int line for one line, the rest of the frame, then the YM sample
    clock re-anchors (as exact_run_frame does). Time inside a frame is the Z80's own. The V-int
    line starts where the Z80 is: the 8-line slices of the 68000's bus releases have usually run
    it well past the frame's first line, and an IRQ held only there was never taken (X-Men 2's
-   driver, paced by it, went silent after its init). */
+   driver, paced by it, went silent after its init).
+   Its audio: the chips advance one wall frame per presented frame (the mixer's drain, after
+   the game's sync interval), so this frame's Z80 writes are stamped in that drain's frame. The
+   bus releases' slices of the interval that follows run after them, on the Z80 clock already
+   re-based for the next frame, so they are stamped one frame on (stamp base F): the mixer
+   defers them to the next drain, ahead of that frame's own Z80 time, in execution order.
+   Before 2026-10-29 they were stamped at the start of this frame's drain, ahead of Z80 time
+   that ran before them: a driver fed through 3 releases an interval had ~24 lines of each
+   frame's Z80 time played a frame early and out of order (59,896 writes in 688 of 1,500 idle
+   frames), heard as an occasional skipped beat. Output only: the stamp is no machine state. */
 static void fsync_z80_frame(void)
 {
     const uint32_t F = LINES * MPL;
+    g_z80_exact_stamp_base = 0;
+    fsync_zlog(s_zclk);
     for (int i = 0; i < 262; i++) input_refresh();
     if (s_zstate == 1) {
         machine_z80_exact_irq(1);
@@ -1694,6 +1726,7 @@ static void fsync_z80_frame(void)
         s_fm_count = s_fm_start = s_fm_start + k * FM_SAMPLE - F;
     }
     s_zclk -= F;
+    g_z80_exact_stamp_base = F;      /* the interval's Z80 time: after this frame's drain */
 }
 
 /* ======================================================================== */
