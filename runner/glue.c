@@ -536,7 +536,9 @@ int recomp_exact_ram_run(uint32_t addr, int (*has_entry)(uint32_t))
         const char *e = getenv("GENESIS_NO_RAM_OVERLAYS");
         s_overlays = !(e && *e && *e != '0');
     }
-    if (s_overlays && !g_game_spec.stepped)
+    /* the stepped runners too: their untimed code has the overlays since the frame-synchronous
+       raster (GameSpec.fsync_raster), which runs the H-int handler in RAM every line */
+    if (s_overlays)
         for (int i = 0; i < g_recomp_ram_code_count; i++)
             if (g_recomp_ram_code[i].addr == addr && recomp_ram_code_matches(&g_recomp_ram_code[i])) {
                 g_recomp_ram_code[i].fn();

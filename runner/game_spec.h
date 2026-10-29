@@ -220,6 +220,13 @@ typedef struct GameSpec {
      * routine's entry, while a busy flag still sends the V-int down its lag
      * path), so the wait is where the full V-int belongs. 0 = X-Men 2's rule. */
     int             fsync_vint_at_wait;
+    /* Frame-synchronous runner only: 1 = the H-int raster. After each V-int the frame is drawn
+     * line by line, and at each line where the VDP's H-int counter (reg 10) fires, with H-int
+     * enabled (reg 0 bit 4) and the interrupt mask below 4, the game's H-int handler runs
+     * before the next line is drawn, so per-line VSRAM, H-scroll and register writes show
+     * (exact_sched.c, fsync_display). 0 = no H-int at all (the frame drawn once after the
+     * V-int, X-Men 2's machine). */
+    int             fsync_raster;
     /* Every XENTRY (any function, after the position bookkeeping). Return nonzero
      * when the hook ran the function's body itself (a verification harness): the
      * generated wrapper then returns at once. NULL = 0. */

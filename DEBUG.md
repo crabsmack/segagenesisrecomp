@@ -174,10 +174,27 @@ lines, diffs against a checked-in baseline JSON.
 
 The other way round, `--no-render` (with `--benchmark N`, not with the hash
 options) makes a frame-synchronous runner (`GameSpec.stepped`) render no
-frame at its sync points (`exact_sched.c` `fsync_render`): for headless
+frame at its sync points (`exact_sched.c` `fsync_display`): for headless
 traces that compare state rows and no picture. The render changes nothing
 the game reads in that mode (the status it reads shows no sprite flags), so
-the rows are the same; only the framebuffer stays empty.
+the rows are the same; only the framebuffer stays empty. With
+`GameSpec.fsync_raster` the H-ints still run line by line without the
+picture: they are machine state, the pixels are not.
+
+Frame-synchronous raster diagnostics (`exact_sched.c`, all env-gated, off by
+default):
+
+- `GENESIS_FSYNC_HLOG=path`: per display, the H-ints taken, the first and
+  last line they ended (-1: at the display's start), VDP reg 0, reg 10, SR.
+- `GENESIS_LINELOG=from,to,path` (any exact runner, timed too): per drawn
+  line of those runner frames, the V-scroll (VSRAM 0/1 and a hash of all
+  40), the line's H-scroll words and VDP regs 1/2/4/11. A timed and a
+  frame-synchronous run compare line by line without pixels.
+- `GENESIS_SYNC_STATE_OUT=N,path` / `GENESIS_SYNC_STATE_IN=N,path`: write
+  the CPU registers, work RAM and VDP at sync point N (any exact runner), or
+  load them there (stepped). Puts a frame-synchronous run into a timed run's
+  game state at a sync point of the same scene loop, so the two pictures can
+  be compared where a desynced movie never takes the stepped machine.
 
 Per-game wrappers:
 

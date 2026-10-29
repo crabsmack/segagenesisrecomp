@@ -1239,27 +1239,168 @@ static void fsync_z80_frame(void);
 static uint64_t s_fs_reads;
 
 /* The frame-synchronous runner's picture: the whole frame from the VDP as the V-int handler left
-   it, which is what the active display shows (minus mid-frame raster changes: no H-int here, and
-   the main program's VDP writes show from the next frame). Into the sink of the exact_run_frame
-   that resumed the game. */
+   it, which is what the active display shows (the main program's VDP writes show from the next
+   frame). Into the sink of the exact_run_frame that resumed the game.
+   With GameSpec.fsync_raster the display after each V-int is also where the H-int runs: the
+   frame is drawn line by line, and at the end of each line where the VDP's H-int counter fires
+   (reg 10; reloaded at the display's start, as the timed frame reloads it in vblank), with H-int
+   enabled (reg 0 bit 4) and the 68000's mask below 4, the game's H-int handler runs on the game
+   fiber before the next line is drawn: per-line VSRAM, H-scroll table and register writes show
+   where the cartridge shows them. The 68000 side: the main program is parked where the V-int
+   took it (its wait site, or the sync point), so each H-int is an interrupt of that context:
+   take_interrupt pushes the parked PC and SR on the main program's A7 and the handler's RTE
+   returns there, exactly like the V-int just before; the mask is the main program's SR at the
+   wait (the V-int handler's RTE restored it). Only the program's own accesses drive it (VDP
+   registers 0, 10 and the mask it set), so generated code and C see the same machine; the
+   picture (--no-render) does not change it: the H-ints run whether lines are drawn or not.
+   The latch: the counter firing while H-int is disabled leaves it pending (a per-line V-scroll
+   handler that disables itself after its 224th line: lines 223 and 224 then set the latch); a
+   pending latch is taken when a display starts with H-int enabled, i.e. at the V-int's RTE
+   once the V-int handler re-enabled it, as on the timed runner (measured there: the first
+   H-int of such a frame runs 10 lines after the V-int, writing line 0's V-scroll; the other
+   223 at the ends of lines 0-222). What it leaves out: an H-int the main program
+   unmasks or enables between displays is taken at the next display's start, not at once. */
 static GenesisScanlineSink s_fs_sink;
 static void *s_fs_user;
 static int s_fs_no_render;   /* exact_set_render(0): no picture (configuration, not state) */
 
 void exact_set_render(int on) { s_fs_no_render = !on; }
 
-static void fsync_render(void)
+/* GENESIS_FSYNC_HLOG=path (diagnostics): one line per raster display, `sync,hints,first,last,r0,r10,sr`
+   (the H-ints taken and the lines they ended; -1 = taken at the display's start). */
+static FILE *s_fs_hlog;
+static void fsync_hlog(int hints, int first, int last)
+{
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *p = getenv("GENESIS_FSYNC_HLOG");
+        if (p && *p && (s_fs_hlog = fopen(p, "w")) != NULL) fprintf(s_fs_hlog, "sync,hints,first,last,r0,r10,sr\n");
+    }
+    if (s_fs_hlog) { fprintf(s_fs_hlog, "%llu,%d,%d,%d,%02X,%02X,%04X\n", (unsigned long long)s_sync_no, hints, first, last, REG(0), REG(10), (unsigned)g_cpu.SR); fflush(s_fs_hlog); }
+}
+
+/* GENESIS_LINELOG=from,to,path (diagnostics, any exact runner): per drawn line of runner frames
+   [from, to], the scroll state the line is drawn with: `frame,line,vs0,vs1,vsh,hsa,hsb,r1,r2,r4,
+   r11` (VSRAM words 0/1, an FNV-1a over all 40, the H-scroll table words for the line, VDP
+   registers). A timed and a frame-synchronous run's lines compare without the pixels: the raster
+   is what the H-int writes there. Reads only. */
+static FILE *s_ll_f;
+static unsigned long long s_ll_from, s_ll_to;
+static void line_log(int line)
+{
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("GENESIS_LINELOG");
+        char path[512] = "";
+        if (e && sscanf(e, "%llu,%llu,%511s", &s_ll_from, &s_ll_to, path) == 3 && (s_ll_f = fopen(path, "w")))
+            fprintf(s_ll_f, "frame,line,vs0,vs1,vsh,hsa,hsb,r1,r2,r4,r11\n");
+    }
+    if (!s_ll_f || s_frame_no < s_ll_from || s_frame_no > s_ll_to) return;
+    const GVDP *v = V;
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 40; i++) h = (h ^ v->vsram[i]) * 16777619u;
+    uint32_t base = ((uint32_t)REG(13) & 0x3Fu) << 10;
+    unsigned mode = REG(11) & 3u, idx = mode == 3 ? (unsigned)line : mode == 2 ? (unsigned)line & ~7u : 0u;
+    uint32_t a = (base + idx * 4u) & 0xFFFFu;
+    uint16_t hsa = (uint16_t)((v->vram[a] << 8) | v->vram[(a + 1) & 0xFFFFu]);
+    uint16_t hsb = (uint16_t)((v->vram[(a + 2) & 0xFFFFu] << 8) | v->vram[(a + 3) & 0xFFFFu]);
+    fprintf(s_ll_f, "%llu,%d,%03X,%03X,%08X,%04X,%04X,%02X,%02X,%02X,%02X\n", (unsigned long long)s_frame_no,
+            line, (unsigned)(v->vsram[0] & 0x7FF), (unsigned)(v->vsram[1] & 0x7FF), h, hsa, hsb,
+            REG(1), REG(2), REG(4), REG(11));
+    if (s_frame_no == s_ll_to && line == 0) fflush(s_ll_f);
+}
+
+static int fsync_hint(uint32_t pc)
+{
+    if (!(s_hint_pending & REG(0) & 0x10) || ((g_cpu.SR >> 8) & 7u) >= 4u) return 0;
+    take_interrupt(pc, 4);
+    return 1;
+}
+
+static void fsync_display(uint32_t pc)
 {
     extern void machine_render_line(int line, GenesisScanlineSink sink, void *user);
-    if (s_fs_no_render) return;
     int h = (REG(1) & 0x04) ? ((REG(1) & 0x08) ? 240 : 224) : 192;
-    for (int line = 0; line < h; line++) machine_render_line(line, s_fs_sink, s_fs_user);
+    if (!g_game_spec.fsync_raster) {
+        if (s_fs_no_render) return;
+        for (int line = 0; line < h; line++) { line_log(line); machine_render_line(line, s_fs_sink, s_fs_user); }
+        return;
+    }
+    int counter = REG(10), hints = 0, first = 0, last = 0;
+    if (fsync_hint(pc)) { hints++; first = last = -1; }      /* a latch the V-int re-enabled */
+    for (int line = 0; line <= h; line++) {                  /* the active lines, then vblank's first */
+        if (--counter < 0) { counter = REG(10); s_hint_pending = 0x10; }
+        if (line < h) { line_log(line); if (!s_fs_no_render) machine_render_line(line, s_fs_sink, s_fs_user); }
+        if (fsync_hint(pc)) { if (!hints++) first = line; last = line; }
+    }
+    fsync_hlog(hints, first, last);
+}
+
+/* The frame-synchronous V-int: with the raster, latched like the timed one, so its acknowledge
+   leaves a pending H-int latch alone (irq_ack). */
+static void fsync_take_vint(uint32_t pc)
+{
+    if (g_game_spec.fsync_raster) { s_vint_pending = 0x20; s_status |= 0x80; }
+    take_interrupt(pc, 6);
+}
+
+/* GENESIS_SYNC_STATE_OUT=N,path (any exact runner) / GENESIS_SYNC_STATE_IN=N,path (stepped)
+   (diagnostics): at sync point N, before its row, write / read the 68000 side of the machine:
+   the CPU registers, work RAM, the VDP (memories, registers, latches; not its host hooks) and the
+   H-int latch. The Z80 and the scheduler's clocks stay the runner's own. Puts a frame-synchronous
+   run into a timed run's game state at a sync point of the same scene loop (the same call chain:
+   the stacked returns are the timed run's), so their pictures compare where the stepped corpus
+   never goes (raster scenes a desynced movie never reaches). Off unless set; nothing else
+   reads it. */
+static void sync_state_io(void)
+{
+    static int init;
+    static unsigned long long out_n, in_n;
+    static char out_p[512], in_p[512];
+    if (!init) {
+        init = 1;
+        const char *e = getenv("GENESIS_SYNC_STATE_OUT");
+        if (e && sscanf(e, "%llu,%511s", &out_n, out_p) != 2) out_n = 0;
+        e = getenv("GENESIS_SYNC_STATE_IN");
+        if (e && sscanf(e, "%llu,%511s", &in_n, in_p) != 2) in_n = 0;
+    }
+    const size_t vdp_n = offsetof(GVDP, bus_read);
+    if (out_n && s_sync_no == out_n) {
+        FILE *f = fopen(out_p, "wb");
+        if (f) {
+            fwrite("XSS1", 1, 4, f);
+            fwrite(&g_cpu, sizeof g_cpu, 1, f);
+            fwrite(g_ram, 1, 0x10000, f);
+            fwrite(&g_machine.vdp, 1, vdp_n, f);
+            fwrite(&s_hint_pending, 1, 1, f);
+            fclose(f);
+            fprintf(stderr, "[sync-state] wrote sync %llu to %s\n", out_n, out_p);
+        }
+    }
+    if (in_n && s_sync_no == in_n && s_stepped) {
+        FILE *f = fopen(in_p, "rb");
+        char magic[4] = { 0 };
+        if (!f || fread(magic, 1, 4, f) != 4 || memcmp(magic, "XSS1", 4) ||
+            fread(&g_cpu, sizeof g_cpu, 1, f) != 1 || fread(g_ram, 1, 0x10000, f) != 0x10000 ||
+            fread(&g_machine.vdp, 1, vdp_n, f) != vdp_n || fread(&s_hint_pending, 1, 1, f) != 1) {
+            fprintf(stderr, "[sync-state] cannot read %s\n", in_p);
+            exit(2);
+        }
+        fclose(f);
+        GVDP *v = V;
+        if (v->colour_updated)
+            for (unsigned i = 0; i < GVDP_CRAM_ENTRIES; i++) v->colour_updated(v->colour_updated_user, i, v->cram[i]);
+        fprintf(stderr, "[sync-state] loaded %s at sync %llu\n", in_p, in_n);
+    }
 }
 
 static void sync_point(void)
 {
     uint64_t frame = s_frame_no;
     s_sync_no++;
+    sync_state_io();
     if (s_replay) {
         if (s_rec.type != 'S') rp_divergence("sync point the reference did not reach here");
         if (s_rec.sync != s_sync_no || s_rec.entries != s_pos[0].entries)
@@ -1278,7 +1419,7 @@ static void sync_point(void)
             s_fs_reads = 0;
         } else {
             fsync_vint();
-            fsync_render();
+            fsync_display(g_xpc);
         }
     }
 }
@@ -1357,7 +1498,7 @@ static void fsync_vint(void)
 {
     s_fs_vblank = 0;
     s_fs_reads = 0;
-    if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) take_interrupt(g_xpc, 6);
+    if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) fsync_take_vint(g_xpc);
 }
 
 /* The main program waits for the V-int without a sync point: it spins on a RAM flag only the
@@ -1365,15 +1506,16 @@ static void fsync_vint(void)
    gets the V-int mid-frame; the frame-synchronous one takes it only at sync points, so the
    game calls this from the wait (a game_hook site, or the hand C's IRQ_WAIT) and the V-int is
    taken now. Elsewhere a no-op. With GameSpec.fsync_vint_at_wait this is the frame's only
-   V-int, so the picture is rendered after it. */
+   V-int, so the picture is rendered after it (with GameSpec.fsync_raster, line by line with the
+   H-ints: fsync_display). */
 void x68k_wait_vint(uint32_t pc)
 {
     if (!s_fsync) return;
     if ((REG(1) & 0x20) && ((g_cpu.SR >> 8) & 7u) < 6u) {
-        take_interrupt(pc, 6);
+        fsync_take_vint(pc);
         if (g_game_spec.fsync_vint_at_wait) {
             s_fs_vblank = 0;
-            fsync_render();
+            fsync_display(pc);
         }
     }
 }
@@ -1873,6 +2015,7 @@ void exact_run_frame(GenesisScanlineSink sink, void *user)
         input_refresh();
         hint_tick(&h_counter);
         if (s_dma_length) dma_update_at(s_mline, 0);
+        line_log(line);
         machine_render_line(line, sink, user);
         run_line_end(s_mline + MPL);
         s_mline += MPL;
