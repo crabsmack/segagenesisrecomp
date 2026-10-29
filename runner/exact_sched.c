@@ -271,6 +271,19 @@ static void irqpc_count(uint32_t pc, unsigned level)
 static void take_interrupt(uint32_t pc, unsigned level)
 {
     irqpc_count(pc, level);
+    if (g_game_spec.take_interrupt) {
+        /* the game's own 68000 side (GameSpec.take_interrupt): the machine acknowledges the
+           interrupt and keeps the positions and the depth around the game's handler */
+        irq_ack(level);
+        g_xirq_taken++;
+        g_xclk += 44u * MCLK_68K;
+        pos_irq_enter(level);
+        s_irq_depth++;
+        g_game_spec.take_interrupt(level, pc);
+        s_irq_depth--;
+        pos_irq_leave();
+        return;
+    }
     uint16_t sr = g_cpu.SR;
     g_cpu.SR = (uint16_t)((sr & ~0x8000u) | 0x2000u);        /* S set, T clear */
     g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0700u) | (level << 8));

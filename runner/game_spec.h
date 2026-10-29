@@ -227,6 +227,14 @@ typedef struct GameSpec {
      * (exact_sched.c, fsync_display). 0 = no H-int at all (the frame drawn once after the
      * V-int, X-Men 2's machine). */
     int             fsync_raster;
+    /* Exact runners: the 68000 side of an interrupt is the game's (a native port's own flow
+     * runtime, no emulated 68000 under the C). When set, the machine
+     * decides when an interrupt is taken and acknowledges it, keeps the logical positions and
+     * the handler depth, and calls this instead of doing the exception itself (the frame push,
+     * the vector's handler, its RTE): `pc` is where the interrupted program continues. The game
+     * then keeps g_cpu.SR's interrupt mask current, the only CPU state the machine still reads
+     * (the waits and the raster's H-int test). NULL = the emulated 68000 takes it. */
+    void          (*take_interrupt)(unsigned level, uint32_t pc);
     /* Every XENTRY (any function, after the position bookkeeping). Return nonzero
      * when the hook ran the function's body itself (a verification harness): the
      * generated wrapper then returns at once. NULL = 0. */
