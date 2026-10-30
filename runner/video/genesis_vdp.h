@@ -312,6 +312,7 @@ typedef struct GVDPStats {
     uint64_t sprite_drops_count;      /* sprites on a line past the 20th (16th H32) */
     uint64_t sprite_drops_pixels;     /* sprites within the count cut short or not
                                          drawn because the line's pixel budget ran out */
+    uint64_t sprite_masked_lines;     /* lines on which an x=0 sprite masked the rest */
     uint64_t host_sat_sprites;        /* host-table sprites drawn on a line         */
     uint64_t ws_margin_columns;       /* 2-cell V-scroll margin columns drawn, per line */
     uint64_t ws_edge_clamped_columns; /* of those, drawn with the edge clamp (not filled) */

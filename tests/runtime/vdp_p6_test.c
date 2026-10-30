@@ -155,12 +155,18 @@ static void test_host_sat(void)
     hs[1] = (GVDPHostSat){ 128, 0, 0, 0x0003, 0 };      /* raw x 0 */
     hs[2] = (GVDPHostSat){ 128, 0, 0, 0x0003, 128 + 240 };
     gvdp_set_host_sat(hs, 3);
+    gvdp_reset_stats();
     render(0);
     CHECK(row[200] == 2 && row[240] == 0);
+    gvdp_get_stats(&st);
+    CHECK(st.sprite_masked_lines == 1);
     hs[1].x = 128 + 300;                                /* not a mask: drawn */
     gvdp_set_host_sat(hs, 3);
+    gvdp_reset_stats();
     render(0);
     CHECK(row[240] == 3 && row[300] == 3);
+    gvdp_get_stats(&st);
+    CHECK(st.sprite_masked_lines == 0);
 
     /* limits on: a line the SAT filled draws no host sprite; one short of it draws one */
     gvdp_set_unlimited_sprites(0);

@@ -891,6 +891,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset, int shi
 
     /* Counters: the sprites a per-line limit dropped (read-only walk of what is left). */
     s_stats.sprite_lines++;
+    if (L.masked) s_stats.sprite_masked_lines++;
     if (stop) {
         uint64_t by_count = 0, by_pixels = 0;
         int k = L.on_line;                 /* the stopping sprite's place on the line */
