@@ -17,6 +17,8 @@ static void scene(unsigned count,unsigned size)
         word(a,128); v.vram[a+2]=size; v.vram[a+3]=i+1<count?i+1:0;
         word(a+4,0x8001); word(a+6,128+i*8);
     }
+    /* the SAT as the VDP caches it (Y, size, link): written past the port */
+    for (unsigned a=0xF800;a<0xFC00;++a) gvdp_sat_byte(&v,(uint16_t)a,v.vram[a]);
 }
 int main(void)
 {
@@ -27,7 +29,8 @@ int main(void)
     gvdp_render_scanline(&v,0,row); CHECK(row[160]==1 && !v.sprite_overflow);
     /* Eleven 32px sprites exhaust the pixel budget before the count limit. */
     scene(11,12); gvdp_set_unlimited_sprites(0);
-    gvdp_render_scanline(&v,0,row); CHECK(row[108]==0 && v.sprite_overflow);
+    /* (no status bit: overflow is the 21st sprite, set when a line is parsed) */
+    gvdp_render_scanline(&v,0,row); CHECK(row[108]==0 && !v.sprite_overflow);
     gvdp_set_unlimited_sprites(1); v.sprite_overflow=0;
     gvdp_render_scanline(&v,0,row); CHECK(row[108]==1 && !v.sprite_overflow);
     /* Intentional sprite masks (including native split-screen) still work. */

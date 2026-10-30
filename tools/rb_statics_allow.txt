@@ -29,6 +29,12 @@
 ^s_(fm|psg)_(accum|count)$
 ^(rowbuf|idxbuf|drawn)\.[0-9]+$
 ^s_spr_(idx|op|hi|shadow_op|hilite_op)$
+# VDP presentation inputs the host sets (genesis_vdp.h phase-6 extensions:
+# margin V-scroll columns, the host sprite table, the widescreen sprite
+# budget) and the render counters; no tick reads them
+^s_ws_(vcol|vcol_set|authentic_budget)$
+^s_host_sat(_count)?$
+^s_stats$
 # snapshotted in a compact/re-based form, so the raw image differs by design:
 # the event ring (queued events re-based to index 0), the FM/PSG undrained
 # output (re-based to index 0), the mixer's per-drain scratch

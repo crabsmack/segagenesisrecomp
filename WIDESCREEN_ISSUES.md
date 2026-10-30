@@ -169,6 +169,47 @@ generated C is unaffected by the core changes until sites are added
   margin, keeping the authentic 16px inset from the TRUE left edge. 2P split
   HUD untouched (widescreen gated off in 2P). Data-only (game.toml).
 
+## The renderer at 16:9 (400 px x 224, 40-px margins): audit and extensions (2026-10-30)
+
+Audited for a native port whose own hand-written C widens the game (rather than
+`[[widescreen_site]]` injection into generated code). What `gvdp_render_scanline`
+already does right in the margins: per-line H-scroll (every mode: the line's
+table entry applies across the whole row), full-screen V-scroll (per line: a
+host that renders each line after its H-int work gets an H-int raster's VSRAM
+rewrites in the margins as well), plane wrap (64/128-cell planes are 512/1024
+px, wider than 400; the margins sample whatever the game wrote there), 10-bit
+sprite X (screen -40..359 is raw 88..487: inside 9 bits), the x=0 masking rule
+(9-bit, as the hardware), the 32-px collision border around the output width.
+
+What it did not, and the opt-in extension now in `genesis_vdp.h` (each off or
+empty by default; the renderer's output and the VDP struct are unchanged
+without them: `tests/runtime/run_vdp_render_diff.py --msvc` against the old
+renderer, 4000 random + 1500 crowded-sprite lines, with planted-change controls):
+
+- **2-cell V-scroll in the margins** clamped every margin column to the edge
+  column. `gvdp_set_ws_vscroll_column(col, vs_a, vs_b)` fills screen column
+  `col` (floor(x/16): -3..-1 and 20..22 for 40-px margins, -8..27 accepted),
+  kept until set again or `gvdp_clear_ws_vscroll_column(s)`; set it between
+  lines to follow an H-int raster. `GVDPStats.ws_edge_clamped_columns` counts
+  margin columns still drawn with the clamp (per line).
+- **The sprite pixel budget** was the output width (400 with margins, the
+  canvas width when pillarboxed), so a widened line drew sprites the 4:3 line
+  drops. `gvdp_set_ws_authentic_sprite_budget(1)` keeps the authentic width
+  (320/256): for the same sprite table the centre equals the 4:3 line. Sprites
+  added for the margins still spend that budget (the hardware counts off-screen
+  sprites): pair widened culls with `gvdp_set_unlimited_sprites(1)` or order
+  margin-only sprites last.
+- **Sprites past the 80-entry table**: `gvdp_set_host_sat(list, n)` draws up to
+  `GVDP_HOST_SAT_MAX` (256) entries in SAT format after the chain's end, with
+  the SAT's priority, operator, masking and limit rules, raising no status bit.
+- **Drop counters**: `GVDPStats.sprite_drops_count` / `sprite_drops_pixels` /
+  `sprite_drop_lines` (per-line limit drops, 0 with unlimited sprites).
+
+Not handled (not needed by that game): the window plane is still drawn only
+inside the authentic columns (a window-using scene shows plane A in the
+margins); 32-cell (256-px) planes repeat inside a 400-px view; the host
+presents square pixels, so 400 x 224 is 1.79:1.
+
 ## Remaining work (next session)
 
 1. **SonicAndKnucklesRecomp (S&K alone):** swap `Sonic3AndKnucklesRecomp/game/sandk/sandk.bin` → canonical slice

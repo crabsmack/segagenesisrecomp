@@ -81,6 +81,18 @@ add_executable(vdp_host_sprite_test runtime/vdp_host_sprite_test.c
 target_include_directories(vdp_host_sprite_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../runner/video")
 add_test(NAME vdp_host_sprite COMMAND vdp_host_sprite_test)
 
+# the phase-6 presentation extensions: margin V-scroll columns, the host sprite
+# table, the drop counters, the authentic sprite budget (each with its control)
+add_executable(vdp_p6_test runtime/vdp_p6_test.c
+    "${CMAKE_CURRENT_LIST_DIR}/../runner/video/genesis_vdp.c")
+target_include_directories(vdp_p6_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../runner/video")
+add_test(NAME vdp_p6 COMMAND vdp_p6_test)
+add_executable(vdp_p6_batched_test runtime/vdp_p6_test.c
+    "${CMAKE_CURRENT_LIST_DIR}/../runner/video/genesis_vdp.c")
+target_include_directories(vdp_p6_batched_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../runner/video")
+target_compile_definitions(vdp_p6_batched_test PRIVATE GENESIS_BATCHED_PLANES=1)
+add_test(NAME vdp_p6_batched COMMAND vdp_p6_batched_test)
+
 if(EXISTS "${CMAKE_SOURCE_DIR}/recomp-ui/src/recomp_launcher.h")
     if(TARGET SDL2::SDL2)
         add_executable(party_input_test runtime/party_input_test.c

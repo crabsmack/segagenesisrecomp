@@ -26,6 +26,7 @@ int main(void)
     memset(v.vram+32,0x11,128);
     word(0xF800,128); v.vram[0xF802]=0; v.vram[0xF803]=0;  /* one 8x8 native sprite */
     word(0xF804,0x0001); word(0xF806,128);
+    for (unsigned a=0xF800;a<0xF808;++a) gvdp_sat_byte(&v,(uint16_t)a,v.vram[a]); /* the VDP's SAT cache */
     word(0xC004,0xA002);                                  /* plane A x=16..23: high, palette 1 */
     gvdp_render_scanline(&v,0,row);
     CHECK(row[4]==1 && row[12]==0 && row[20]==17);

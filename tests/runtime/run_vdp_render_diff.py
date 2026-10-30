@@ -40,6 +40,12 @@ SYMBOLS = [
     "gvdp_unlimited_sprites", "gvdp_set_host_palette", "gvdp_host_palette",
     "gvdp_set_host_sprites", "gvdp_rb_pending_stall", "gvdp_rb_set_pending_stall",
     "gvdp_plane_implementation",
+    # phase-6 extensions (absent from older baselines: renaming them there is harmless)
+    "gvdp_set_ws_authentic_sprite_budget",
+    "gvdp_set_ws_vscroll_column", "gvdp_clear_ws_vscroll_column", "gvdp_clear_ws_vscroll_columns",
+    "gvdp_set_host_sat", "gvdp_host_sat_count", "gvdp_get_stats", "gvdp_reset_stats",
+    "gvdp_sat_byte", "gvdp_sprite_parse", "gvdp_store_vram_word", "gvdp_store_cram",
+    "gvdp_store_vsram",
 ]
 
 
@@ -52,10 +58,44 @@ def defs(prefix: str) -> list[str]:
     return [f"-D{s}={prefix}_{s}" for s in SYMBOLS]
 
 
+def msvc_env() -> dict[str, str]:
+    """The environment of the newest Visual Studio's vcvars64.bat (found by vswhere)."""
+    import os
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / \
+        "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    inst = subprocess.check_output([str(vswhere), "-latest", "-products", "*", "-property",
+                                    "installationPath"], text=True).strip()
+    bat = Path(inst) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    out = subprocess.check_output(f'cmd /s /c ""{bat}" >nul && set"', text=True, shell=True)
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def build_msvc(ns, root: Path, out: Path, baseline: Path, candidate: Path, include: Path,
+               test: Path) -> Path:
+    import shutil
+    env = msvc_env()
+    exe = out / "vdp_render_diff_test_msvc.exe"
+    path = next(v for k, v in env.items() if k.upper() == "PATH")
+    common = [shutil.which("cl", path=path), "/nologo", "/O2", "/DNDEBUG", "/W3", "/wd4244", "/wd4267", "/I", str(include)]
+
+    def cl(args: list[str]) -> None:
+        print("+ " + " ".join(args))
+        subprocess.run(args, cwd=out, check=True, env=env)
+
+    cl(common + defs("head") + ["/c", str(baseline), "/Fo" + str(out / "genesis_vdp_head.obj")])
+    cl(common + defs("cand") + ["-D" + d for d in ns.candidate_define] +
+       ["/c", str(candidate), "/Fo" + str(out / "genesis_vdp_cand.obj")])
+    cl(common + [str(test), str(out / "genesis_vdp_head.obj"), str(out / "genesis_vdp_cand.obj"),
+                 "/Fe" + str(exe)])
+    return exe
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--gcc", default=r"C:\msys64\mingw64\bin\gcc.exe")
+    parser.add_argument("--msvc", action="store_true",
+                        help="build with the newest Visual Studio's cl (vswhere) instead of gcc")
     parser.add_argument("--baseline-ref", default="997bd1f1c754f38dd598318661b2a52553d33cc0")
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--candidate-source", type=Path)
@@ -80,6 +120,9 @@ def main() -> int:
     candidate = candidate.resolve(strict=True)
     include = root / "runner" / "video"
     test = root / "tests" / "runtime" / "vdp_render_diff_test.c"
+    if ns.msvc:
+        run([str(build_msvc(ns, root, out, baseline, candidate, include, test))], root)
+        return 0
     head_obj = out / "genesis_vdp_head.o"
     cand_obj = out / "genesis_vdp_cand.o"
     exe = out / "vdp_render_diff_test.exe"

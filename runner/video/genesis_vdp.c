@@ -582,6 +582,49 @@ void gvdp_set_ws_bar_black(int black) { s_ws_bar_black = black ? 1 : 0; }
 static int s_ws_bgdiag = 0;
 void gvdp_set_bgdiag(int on) { s_ws_bgdiag = on; }
 
+/* Phase-6 presentation extensions (genesis_vdp.h): each off/empty by default,
+ * and with all of them off the renderer's output is unchanged. */
+static int s_ws_authentic_budget = 0;
+void gvdp_set_ws_authentic_sprite_budget(int on) { s_ws_authentic_budget = on ? 1 : 0; }
+
+/* Margin 2-cell V-scroll columns, indexed col - GVDP_WS_VCOL_FIRST. */
+#define WS_VCOL_N (GVDP_WS_VCOL_LAST - GVDP_WS_VCOL_FIRST + 1)
+static uint16_t s_ws_vcol[WS_VCOL_N][2];
+static uint8_t  s_ws_vcol_set[WS_VCOL_N];
+int gvdp_set_ws_vscroll_column(int col, uint16_t vs_a, uint16_t vs_b)
+{
+    if (col < GVDP_WS_VCOL_FIRST || col > GVDP_WS_VCOL_LAST) return 0;
+    int i = col - GVDP_WS_VCOL_FIRST;
+    s_ws_vcol[i][0] = vs_a & 0x07FF;
+    s_ws_vcol[i][1] = vs_b & 0x07FF;
+    s_ws_vcol_set[i] = 1;
+    return 1;
+}
+void gvdp_clear_ws_vscroll_column(int col)
+{
+    if (col >= GVDP_WS_VCOL_FIRST && col <= GVDP_WS_VCOL_LAST)
+        s_ws_vcol_set[col - GVDP_WS_VCOL_FIRST] = 0;
+}
+void gvdp_clear_ws_vscroll_columns(void) { memset(s_ws_vcol_set, 0, sizeof(s_ws_vcol_set)); }
+
+/* Screen column of x (floor division by 16, negative x included). */
+static int col16(int x) { return x >= 0 ? (x >> 4) : -((15 - x) >> 4); }
+
+static GVDPHostSat s_host_sat[GVDP_HOST_SAT_MAX];
+static unsigned    s_host_sat_count;
+int gvdp_set_host_sat(const GVDPHostSat *list, unsigned count)
+{
+    if (count > GVDP_HOST_SAT_MAX) return 0;
+    if (count) memcpy(s_host_sat, list, count * sizeof(*list));
+    s_host_sat_count = count;
+    return 1;
+}
+unsigned gvdp_host_sat_count(void) { return s_host_sat_count; }
+
+static GVDPStats s_stats;
+void gvdp_get_stats(GVDPStats *out) { *out = s_stats; }
+void gvdp_reset_stats(void) { memset(&s_stats, 0, sizeof(s_stats)); }
+
 int gvdp_active_width(const GVDP *v)
 {
     int w = gvdp_screen_width(v);
@@ -628,11 +671,139 @@ void gvdp_sprite_parse(GVDP *v, int line)
     }
 }
 
-static void sprite_render_line(GVDP *v, int line, int total, int offset, int shift_b)
+/* One sprite line's walk state, shared by the SAT chain and the host table. */
+typedef struct SprLine {
+    GVDP    *v;
+    uint8_t *drawn;
+    int line, total, offset, budget;
+    int im2, cell_h_shift, tile_bytes, sh_mode, max_per_line;
+    int on_line, pixelcount, masked, spr_ovr;
+} SprLine;
+
+enum { SPR_GO = 0, SPR_COUNT_FULL = 1, SPR_PIXELS_FULL = 2 };
+
+/* Draw one sprite whose rows cover the line. Returns SPR_GO, or the per-line
+ * limit that ends the line: SPR_COUNT_FULL (this sprite is past the count and
+ * is not drawn) or SPR_PIXELS_FULL (this sprite is drawn, cut to whole cells;
+ * *cut = it lost pixels to the budget). A host-table sprite (host) raises no
+ * status bit and leaves the VDP's carried masking state alone. */
+static int sprite_draw_one(SprLine *L, int y, int height, uint8_t sz, uint16_t attr,
+                           int xword, int host, int *cut)
+{
+    GVDP *v = L->v;
+    uint8_t *drawn = L->drawn;
+    int line = L->line, total = L->total;
+    int cell_h_shift = L->cell_h_shift, tile_bytes = L->tile_bytes, sh_mode = L->sh_mode;
+    *cut = 0;
+    if (++L->on_line > L->max_per_line && !s_unlimited_sprites) return SPR_COUNT_FULL;
+
+    int hsz    = ((sz >> 2) & 3) + 1;     /* width  in cells (1..4)        */
+    int vsz    = (sz & 3) + 1;            /* height in cells (1..4)        */
+    /* 10-bit sprite X (was 0x1FF). The centered widescreen view needs
+     * sprite X up to ~512 at the right edge; with a 9-bit mask that
+     * wraps to ~0 and renders off the left, leaving wide objects drawn
+     * partially as they scroll in. Reading 10 bits lets off-edge pieces
+     * clip cleanly (screen_x >= total below). Authentic 4:3 never sets
+     * bit 9 (max sprite X ~480), so this is identical there. The game's
+     * BuildSprites/Render_Sprites must likewise mask to $3FF in
+     * widescreen so the high bit survives to the sprite table. */
+    int screen_x  = xword - 128 + L->offset;  /* +offset: center in the output canvas */
+
+    /* Sprite masking (9-bit X as the reference parses it). */
+    if (xword & 0x1FF) L->spr_ovr = 1;
+    else if (L->spr_ovr) L->masked = 1;
+
+    int tile = attr & 0x07FF;
+    int pal  = (attr >> 13) & 0x3;
+    int pri  = (attr & 0x8000) != 0;
+    int hf   = (attr & 0x0800) != 0;
+    int vf   = (attr & 0x1000) != 0;
+    int width = hsz * 8;
+    L->pixelcount += width;
+    int draw_w = width;                       /* cut to whole cells at the pixel limit */
+    if (L->pixelcount > L->budget && !s_unlimited_sprites) {
+        draw_w = (width - (L->pixelcount - L->budget)) & ~7;
+        *cut = draw_w < width;
+    }
+    /* partly on screen: off-screen pixels still collide (see drawn) */
+    int coll = screen_x + width > 0 && screen_x < total && !L->masked;
+    if (!coll) draw_w = 0;
+
+    int iy = vf ? (height - 1 - (line - y)) : (line - y);
+    int celly = iy >> cell_h_shift, fy = iy & ((1 << cell_h_shift) - 1);
+
+#if GENESIS_BATCHED_PLANES
+    /* Resolve sprite cell/row addresses once per eight output pixels.
+     * VRAM is stable during this scanline call; no persistent cache or
+     * invalidation/state migration is involved. */
+    for (int cell = 0; cell < (draw_w >> 3); ++cell) {
+        int cellx = hf ? hsz - 1 - cell : cell;
+        int tileno = (tile + cellx * vsz + celly) & 0x07ff;
+        uint16_t pa = (uint16_t)(tileno * tile_bytes + fy * 4);
+        uint32_t bits = ((uint32_t)v->vram[pa] << 24) |
+            ((uint32_t)v->vram[pa + 1] << 16) |
+            ((uint32_t)v->vram[pa + 2] << 8) | v->vram[pa + 3];
+        for (int fx = 0; fx < 8; ++fx) {
+            int sx = screen_x + cell * 8 + fx;
+            int off = sx < 0 || sx >= total;
+            if (off && !coll) continue;
+            int nib = (bits >> (28 - (fx ^ (hf ? 7 : 0)) * 4)) & 15;
+            if (!nib) continue;
+            if (drawn[sx]) { if (!host) v->sprite_collision = 1; continue; }
+            if (off) { drawn[sx] = 1; continue; }
+            if (sh_mode && pal == 3 && nib == 14)
+                s_spr_hilite_op[sx] = 1;
+            else if (sh_mode && pal == 3 && nib == 15)
+                s_spr_shadow_op[sx] = 1;
+            else {
+                s_spr_idx[sx] = (uint8_t)(pal * 16 + nib);
+                s_spr_op[sx] = 1;
+                s_spr_hi[sx] = (uint8_t)pri;
+                drawn[sx] = 1;
+            }
+        }
+    }
+#else
+    for (int lx = 0; lx < draw_w; lx++) {
+        int sx = screen_x + lx;
+        int off = sx < 0 || sx >= total;
+        if (off && !coll) continue;
+        int ix = hf ? (width - 1 - lx) : lx;
+        int cellx = ix >> 3, fx = ix & 7;
+        int tileno = (tile + cellx * vsz + celly) & 0x07FF;
+        uint16_t pa = (uint16_t)(tileno * tile_bytes + fy * 4 + (fx >> 1));
+        uint8_t byte = v->vram[pa & 0xFFFF];
+        int nib = (fx & 1) ? (byte & 0x0F) : (byte >> 4);
+        if (nib == 0) continue;            /* transparent             */
+
+        if (drawn[sx]) { if (!host) v->sprite_collision = 1; continue; } /* first wins */
+        if (off) { drawn[sx] = 1; continue; }
+
+        if (sh_mode && pal == 3 && nib == 14) {        /* highlight op */
+            s_spr_hilite_op[sx] = 1;
+        } else if (sh_mode && pal == 3 && nib == 15) { /* shadow op    */
+            s_spr_shadow_op[sx] = 1;
+        } else {
+            s_spr_idx[sx] = (uint8_t)(pal * 16 + nib);
+            s_spr_op[sx]  = 1;
+            s_spr_hi[sx]  = (uint8_t)pri;
+            drawn[sx] = 1;
+        }
+    }
+#endif
+    if (L->pixelcount >= L->budget && !s_unlimited_sprites) {
+        if (!host) v->spr_mask_carry = 1;
+        return SPR_PIXELS_FULL;
+    }
+    return SPR_GO;
+}
+
+static void sprite_render_line(GVDP *v, int line, int total, int offset, int shift_b, int budget)
 {
     /* `total` = output columns this row (incl. widescreen margins / pillarbox);
      * `offset` = output column that authentic screen column 0 maps to (centers
-     * the view in the canvas). */
+     * the view in the canvas); `budget` = the line's sprite pixel limit (the
+     * output width, or the authentic width: gvdp_set_ws_authentic_sprite_budget). */
     memset(s_spr_op, 0, (size_t)total);
     memset(s_spr_shadow_op, 0, (size_t)total);
     memset(s_spr_hilite_op, 0, (size_t)total);
@@ -644,6 +815,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset, int shi
     int sh_mode       = MODE4_SHI(v) != 0;
     int cell_h_shift  = im2 ? 4 : 3;          /* cell height 16 or 8 px        */
     int tile_bytes    = im2 ? 64 : 32;
+    int y_mask        = im2 ? 0x3FF : 0x1FF, y_origin = im2 ? 256 : 128;
     uint16_t sat = (uint16_t)((REG_SPRITE_NT(v) & 0x7F) << 9);
 
     /* Tracks the first opaque sprite owner per pixel (first-wins; a second
@@ -671,126 +843,88 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset, int shi
      * the line ends (no status bit: overflow is the 21st/17th sprite, set when the line is
      * parsed, sprite_parse_line). Masking: an x==0 sprite after one with x!=0 on this line,
      * or from the start of a line that follows one which hit the pixel limit. */
-    int link = 0, on_line = 0, pixelcount = 0, masked = 0;
-    int spr_ovr = v->spr_mask_carry;
+    SprLine L = { v, drawn, line, total, offset, budget,
+                  im2, cell_h_shift, tile_bytes, sh_mode, max_per_line,
+                  0, 0, 0, v->spr_mask_carry };
     v->spr_mask_carry = 0;
 
-    for (int n = 0; n < max_sprites; n++) {
+    int link = 0, next = 0, n, stop = SPR_GO, cut = 0;
+    for (n = 0; n < max_sprites; n++) {
         /* Y, size and link from the internal cache, name/attributes and X
          * from VRAM (as the hardware and the reference do). */
         uint16_t e = (uint16_t)(sat + link * 8);
         uint16_t c = (uint16_t)(link * 8);
-        int y      = (sat_read_word(v, c) & (im2 ? 0x3FF : 0x1FF)) - (im2 ? 256 : 128);
+        int y      = (sat_read_word(v, c) & y_mask) - y_origin;
         uint8_t sz = v->sat[(c + 2) & 0x3FF];
-        int hsz    = ((sz >> 2) & 3) + 1;     /* width  in cells (1..4)        */
-        int vsz    = (sz & 3) + 1;            /* height in cells (1..4)        */
-        int height = vsz << cell_h_shift;
-        int next   = v->sat[(c + 3) & 0x3FF] & 0x7F;
+        int height = ((sz & 3) + 1) << cell_h_shift;
+        next       = v->sat[(c + 3) & 0x3FF] & 0x7F;
 
         if (line >= y && line < y + height) {
-            if (++on_line > max_per_line && !s_unlimited_sprites) break;
-
             uint16_t attr = vram_read_word(v, (uint16_t)(e + 4));
-            /* 10-bit sprite X (was 0x1FF). The centered widescreen view needs
-             * sprite X up to ~512 at the right edge; with a 9-bit mask that
-             * wraps to ~0 and renders off the left, leaving wide objects drawn
-             * partially as they scroll in. Reading 10 bits lets off-edge pieces
-             * clip cleanly (screen_x >= total below). Authentic 4:3 never sets
-             * bit 9 (max sprite X ~480), so this is identical there. The game's
-             * BuildSprites/Render_Sprites must likewise mask to $3FF in
-             * widescreen so the high bit survives to the sprite table. */
             int xword     = vram_read_word(v, (uint16_t)(e + 6)) & 0x3FF;
-            int screen_x  = xword - 128 + offset;  /* +offset: center in the output canvas */
-
-            /* Sprite masking (9-bit X as the reference parses it). */
-            if (xword & 0x1FF) spr_ovr = 1;
-            else if (spr_ovr) masked = 1;
-
-            int tile = attr & 0x07FF;
-            int pal  = (attr >> 13) & 0x3;
-            int pri  = (attr & 0x8000) != 0;
-            int hf   = (attr & 0x0800) != 0;
-            int vf   = (attr & 0x1000) != 0;
-            int width = hsz * 8;
-            pixelcount += width;
-            int draw_w = width;                       /* cut to whole cells at the pixel limit */
-            if (pixelcount > total && !s_unlimited_sprites)
-                draw_w = (width - (pixelcount - total)) & ~7;
-            /* partly on screen: off-screen pixels still collide (see drawn) */
-            int coll = screen_x + width > 0 && screen_x < total && !masked;
-            if (!coll) draw_w = 0;
-
-            int iy = vf ? (height - 1 - (line - y)) : (line - y);
-            int celly = iy >> cell_h_shift, fy = iy & ((1 << cell_h_shift) - 1);
-
-#if GENESIS_BATCHED_PLANES
-            /* Resolve sprite cell/row addresses once per eight output pixels.
-             * VRAM is stable during this scanline call; no persistent cache or
-             * invalidation/state migration is involved. */
-            for (int cell = 0; cell < (draw_w >> 3); ++cell) {
-                int cellx = hf ? hsz - 1 - cell : cell;
-                int tileno = (tile + cellx * vsz + celly) & 0x07ff;
-                uint16_t pa = (uint16_t)(tileno * tile_bytes + fy * 4);
-                uint32_t bits = ((uint32_t)v->vram[pa] << 24) |
-                    ((uint32_t)v->vram[pa + 1] << 16) |
-                    ((uint32_t)v->vram[pa + 2] << 8) | v->vram[pa + 3];
-                for (int fx = 0; fx < 8; ++fx) {
-                    int sx = screen_x + cell * 8 + fx;
-                    int off = sx < 0 || sx >= total;
-                    if (off && !coll) continue;
-                    int nib = (bits >> (28 - (fx ^ (hf ? 7 : 0)) * 4)) & 15;
-                    if (!nib) continue;
-                    if (drawn[sx]) { v->sprite_collision = 1; continue; }
-                    if (off) { drawn[sx] = 1; continue; }
-                    if (sh_mode && pal == 3 && nib == 14)
-                        s_spr_hilite_op[sx] = 1;
-                    else if (sh_mode && pal == 3 && nib == 15)
-                        s_spr_shadow_op[sx] = 1;
-                    else {
-                        s_spr_idx[sx] = (uint8_t)(pal * 16 + nib);
-                        s_spr_op[sx] = 1;
-                        s_spr_hi[sx] = (uint8_t)pri;
-                        drawn[sx] = 1;
-                    }
-                }
-            }
-#else
-            for (int lx = 0; lx < draw_w; lx++) {
-                int sx = screen_x + lx;
-                int off = sx < 0 || sx >= total;
-                if (off && !coll) continue;
-                int ix = hf ? (width - 1 - lx) : lx;
-                int cellx = ix >> 3, fx = ix & 7;
-                int tileno = (tile + cellx * vsz + celly) & 0x07FF;
-                uint16_t pa = (uint16_t)(tileno * tile_bytes + fy * 4 + (fx >> 1));
-                uint8_t byte = v->vram[pa & 0xFFFF];
-                int nib = (fx & 1) ? (byte & 0x0F) : (byte >> 4);
-                if (nib == 0) continue;            /* transparent             */
-
-                if (drawn[sx]) { v->sprite_collision = 1; continue; } /* first wins */
-                if (off) { drawn[sx] = 1; continue; }
-
-                if (sh_mode && pal == 3 && nib == 14) {        /* highlight op */
-                    s_spr_hilite_op[sx] = 1;
-                } else if (sh_mode && pal == 3 && nib == 15) { /* shadow op    */
-                    s_spr_shadow_op[sx] = 1;
-                } else {
-                    s_spr_idx[sx] = (uint8_t)(pal * 16 + nib);
-                    s_spr_op[sx]  = 1;
-                    s_spr_hi[sx]  = (uint8_t)pri;
-                    drawn[sx] = 1;
-                }
-            }
-
-#endif
-            if (pixelcount >= total && !s_unlimited_sprites) { v->spr_mask_carry = 1; break; }
+            stop = sprite_draw_one(&L, y, height, sz, attr, xword, 0, &cut);
+            if (stop) break;
         }
 
         if (next == 0 || next >= max_sprites) break;   /* link 0, or past the table's end */
         link = next;
     }
+    /* The border carried to the next line holds the SAT sprites' pixels only. */
     memcpy(v->spr_edge, drawn_buf, 32);
     memcpy(v->spr_edge + 32, drawn_buf + SPR_BORDER + total, 32);
+
+    /* The host table, linked after the SAT chain's end. */
+    int in_sat = stop != SPR_GO;
+    unsigned h = 0;
+    if (!stop) {
+        for (h = 0; h < s_host_sat_count; h++) {
+            const GVDPHostSat *s = &s_host_sat[h];
+            int y = (s->y & y_mask) - y_origin;
+            int height = ((s->size & 3) + 1) << cell_h_shift;
+            if (line >= y && line < y + height) {
+                stop = sprite_draw_one(&L, y, height, s->size, s->attr, s->x & 0x3FF, 1, &cut);
+                if (stop != SPR_COUNT_FULL) s_stats.host_sat_sprites++;
+                if (stop) break;
+            }
+        }
+    }
+
+    /* Counters: the sprites a per-line limit dropped (read-only walk of what is left). */
+    s_stats.sprite_lines++;
+    if (stop) {
+        uint64_t by_count = 0, by_pixels = 0;
+        int k = L.on_line;                 /* the stopping sprite's place on the line */
+        if (stop == SPR_COUNT_FULL) by_count++;
+        else if (cut) by_pixels++;
+        if (in_sat && next != 0 && next < max_sprites) {
+            int lk = next;
+            for (int m = n + 1; m < max_sprites; m++) {
+                uint16_t c = (uint16_t)(lk * 8);
+                int y = (sat_read_word(v, c) & y_mask) - y_origin;
+                int height = ((v->sat[(c + 2) & 0x3FF] & 3) + 1) << cell_h_shift;
+                if (line >= y && line < y + height) {
+                    if (++k > max_per_line) by_count++; else by_pixels++;
+                }
+                int nx = v->sat[(c + 3) & 0x3FF] & 0x7F;
+                if (nx == 0 || nx >= max_sprites) break;
+                lk = nx;
+            }
+        }
+        for (unsigned hh = in_sat ? 0 : h + 1; hh < s_host_sat_count; hh++) {
+            const GVDPHostSat *s = &s_host_sat[hh];
+            int y = (s->y & y_mask) - y_origin;
+            int height = ((s->size & 3) + 1) << cell_h_shift;
+            if (line >= y && line < y + height) {
+                if (++k > max_per_line) by_count++; else by_pixels++;
+            }
+        }
+        if (by_count || by_pixels) {
+            s_stats.sprite_drop_lines++;
+            s_stats.sprite_drops_count += by_count;
+            s_stats.sprite_drops_pixels += by_pixels;
+        }
+    }
+
     /* the next line's sprites are parsed now (overflow is a parse-time flag) */
     if (line + 1 < gvdp_output_height(v))
         gvdp_sprite_parse(v, line + 1);
@@ -956,8 +1090,35 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
     int window_v_in = (wy & 0x80) ? (rline >= window_y) : (rline < window_y);
     int sh_mode = MODE4_SHI(v) != 0;
 
+    /* 2-cell V-scroll in the widescreen margins: each visible margin column's
+     * values for this line, the host's (gvdp_set_ws_vscroll_column) or the
+     * nearest edge column's (the clamp). Index: screen column - FIRST. */
+    int mvs_a[WS_VCOL_N], mvs_b[WS_VCOL_N];
+    if (vmode_2cell && content_extra > 0) {
+        int re = ((w - 1) >> 4) * 2;
+        int edge[2][2] = {
+            { v->vsram[0] & vs_mask, v->vsram[1] & vs_mask },
+            { v->vsram[re % GVDP_VSRAM_ENTRIES] & vs_mask,
+              v->vsram[(re + 1) % GVDP_VSRAM_ENTRIES] & vs_mask } };
+        int c_lo = col16(-content_extra), c_hi = col16(w + content_extra - 1);
+        for (int col = c_lo; col <= c_hi; col++) {
+            if (col == 0) col = w >> 4;               /* skip the authentic columns */
+            int i = col - GVDP_WS_VCOL_FIRST;
+            s_stats.ws_margin_columns++;
+            if (s_ws_vcol_set[i]) {
+                mvs_a[i] = s_ws_vcol[i][0] & vs_mask;
+                mvs_b[i] = s_ws_vcol[i][1] & vs_mask;
+            } else {
+                mvs_a[i] = edge[col > 0][0];
+                mvs_b[i] = edge[col > 0][1];
+                s_stats.ws_edge_clamped_columns++;
+            }
+        }
+    }
+
     /* Sprite layer for this output row (placed in centered output-column space). */
-    sprite_render_line(v, line, total, offset, hs_b & 0x0F);
+    sprite_render_line(v, line, total, offset, hs_b & 0x0F,
+                       s_ws_authentic_budget ? w : total);
     if (s_host_sprites) {
         GVDPSpriteLayer layer = { line, total, offset, s_spr_idx, s_spr_op, s_spr_hi };
         s_host_sprites(s_host_sprites_user, v, &layer);
@@ -971,18 +1132,25 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
     uint8_t plane_a[GVDP_MAX_WIDTH], plane_b[GVDP_MAX_WIDTH];
     for (int x = -content_extra, xo = content_start; xo < content_end;) {
         int boundary;
-        if (x < 0) boundary = 0;
-        else if (x >= w) boundary = w + content_extra;
+        /* In 2-cell mode a margin span ends at its 16-px column (each margin
+         * column has a V-scroll of its own). */
+        if (x < 0) boundary = vmode_2cell ? (col16(x) + 1) * 16 : 0;
+        else if (x >= w) boundary = vmode_2cell ? ((x >> 4) + 1) * 16 : w + content_extra;
         else boundary = ((x >> 4) + 1) * 16;
         if (boundary > w + content_extra) boundary = w + content_extra;
         if (window_x > x && window_x < boundary) boundary = window_x;
         int n = boundary - x;
         int vs_a = full_vs_a, vs_b = full_vs_b;
         if (vmode_2cell) {
-            int xc = x < 0 ? 0 : (x >= w ? w - 1 : x);
-            int col = (xc >> 4) * 2;
-            vs_a = v->vsram[col % GVDP_VSRAM_ENTRIES] & vs_mask;
-            vs_b = v->vsram[(col + 1) % GVDP_VSRAM_ENTRIES] & vs_mask;
+            if (x < 0 || x >= w) {
+                int i = col16(x) - GVDP_WS_VCOL_FIRST;
+                vs_a = mvs_a[i];
+                vs_b = mvs_b[i];
+            } else {
+                int col = (x >> 4) * 2;
+                vs_a = v->vsram[col % GVDP_VSRAM_ENTRIES] & vs_mask;
+                vs_b = v->vsram[(col + 1) % GVDP_VSRAM_ENTRIES] & vs_mask;
+            }
         }
         int window_h_in = window_h_right ? x >= window_x : x < window_x;
         if (x >= 0 && x < w && (window_h_in || window_v_in))
@@ -1013,12 +1181,17 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
         int vs_a, vs_b;
         if (vmode_2cell) {
             /* The 2-cell VSRAM table is defined only across the active window;
-             * clamp margin columns to the nearest edge column to avoid a
-             * negative/out-of-range index. */
-            int xc = x < 0 ? 0 : (x >= w ? w - 1 : x);
-            int col = (xc >> 4) * 2;
-            vs_a = v->vsram[(col + 0) % GVDP_VSRAM_ENTRIES] & vs_mask;
-            vs_b = v->vsram[(col + 1) % GVDP_VSRAM_ENTRIES] & vs_mask;
+             * margin columns take this line's mvs values (the host's, or the
+             * nearest edge column's). */
+            if (x < 0 || x >= w) {
+                int i = col16(x) - GVDP_WS_VCOL_FIRST;
+                vs_a = mvs_a[i];
+                vs_b = mvs_b[i];
+            } else {
+                int col = (x >> 4) * 2;
+                vs_a = v->vsram[(col + 0) % GVDP_VSRAM_ENTRIES] & vs_mask;
+                vs_b = v->vsram[(col + 1) % GVDP_VSRAM_ENTRIES] & vs_mask;
+            }
         } else {
             vs_a = full_vs_a;
             vs_b = full_vs_b;

@@ -10,12 +10,14 @@ void head_gvdp_set_ws_extra(int extra_px);
 void head_gvdp_set_ws_canvas(int canvas_w);
 void head_gvdp_set_ws_bar_black(int black);
 void head_gvdp_set_bgdiag(int on);
+void head_gvdp_set_unlimited_sprites(int enabled);
 
 int cand_gvdp_render_scanline(GVDP *v, int line, uint8_t *out);
 void cand_gvdp_set_ws_extra(int extra_px);
 void cand_gvdp_set_ws_canvas(int canvas_w);
 void cand_gvdp_set_ws_bar_black(int black);
 void cand_gvdp_set_bgdiag(int on);
+void cand_gvdp_set_unlimited_sprites(int enabled);
 
 static uint32_t rng_state = 0x13572468u;
 
@@ -234,6 +236,72 @@ static int run_odd_canvas_cases(void)
     return failures;
 }
 
+/* Crowded lines: a SAT chain of up to 80 (64) entries in a random link order,
+ * with random sizes and x (0 included, for the masking rules) and most rows on
+ * the rendered line, written to the VDP's sprite cache as well as VRAM (the
+ * cases above leave the cache empty), so the count and pixel limits, the
+ * masking carry and the border collisions are reached, limits on and lifted. */
+static void install_crowd(GVDP *v, int h40, int im2, int line)
+{
+    uint16_t sat = (uint16_t)((v->reg[0x05] & 0x7F) << 9);
+    int max_sprites = h40 ? 80 : 64;
+    int y_origin = im2 ? 256 : 128, cell = im2 ? 16 : 8;
+    int order[80];
+    int count = 1 + (int)(rnd() % (uint32_t)max_sprites);
+    for (int i = 0; i < max_sprites; i++) order[i] = i;
+    for (int i = max_sprites - 1; i > 1; i--) {
+        int j = 1 + (int)(rnd() % (uint32_t)i);
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+    memset(v->sat, 0, sizeof(v->sat));
+    for (int k = 0; k < count; k++) {
+        int idx = order[k];
+        int next = k + 1 < count ? order[k + 1] : ((rnd() & 7) ? 0 : 0x7F);
+        uint8_t sz = (uint8_t)(rnd() & 0x0F);
+        int vsz = (sz & 3) + 1;
+        int y = (rnd() & 3) ? line - (int)(rnd() % (uint32_t)(vsz * cell)) + y_origin
+                            : (int)(rnd() & 0x3FF);
+        int x = (rnd() & 7) == 0 ? 0 : (int)(rnd() & ((rnd() & 15) ? 0x1FF : 0x3FF));
+        uint16_t attr = (uint16_t)rnd();
+        uint8_t e[8] = { (uint8_t)(y >> 8), (uint8_t)y, sz, (uint8_t)next,
+                         (uint8_t)(attr >> 8), (uint8_t)attr, (uint8_t)(x >> 8), (uint8_t)x };
+        for (int b = 0; b < 8; b++) {
+            v->vram[(uint16_t)(sat + idx * 8 + b)] = e[b];
+            v->sat[(idx * 8 + b) & 0x3FF] = e[b];
+        }
+    }
+}
+
+static int run_crowded(void)
+{
+    int failures = 0;
+    const int plane_codes[] = { 0x01, 0x11, 0x33 };
+    for (int i = 0; i < 1500; i++) {
+        GVDP v;
+        int h40 = (int)((rnd() % 4) != 0);
+        int im2 = (int)((rnd() % 4) == 0);
+        int sh = (int)(rnd() & 1u);
+        int line = (int)(rnd() % (uint32_t)(im2 ? 448 : 224));
+        int ws_extra = (int[]){0, 0, 40, 64, 96}[rnd() % 5];
+        int ws_canvas = (int[]){0, 0, 400, 448}[rnd() % 4];
+        int unlimited = (int)((rnd() % 3) == 0);
+        char label[64];
+        fill_random(&v, 1, h40, im2, sh, (int)(rnd() & 3u), (int)(rnd() & 1u),
+                    plane_codes[rnd() % 3]);
+        v.spr_mask_carry = (uint8_t)((rnd() & 3) == 0);
+        install_crowd(&v, h40, im2, line);
+        head_gvdp_set_unlimited_sprites(unlimited);
+        cand_gvdp_set_unlimited_sprites(unlimited);
+        snprintf(label, sizeof(label), "crowded-%d-unl%d", i, unlimited);
+        failures += compare_case(label, &v, line, ws_extra, ws_canvas, 0, 0);
+        if (failures > 12)
+            break;
+    }
+    head_gvdp_set_unlimited_sprites(0);
+    cand_gvdp_set_unlimited_sprites(0);
+    return failures;
+}
+
 static int run_import_sequence(void)
 {
     int failures = 0;
@@ -257,10 +325,11 @@ int main(void)
     failures += run_random();
     failures += run_odd_canvas_cases();
     failures += run_import_sequence();
+    failures += run_crowded();
     if (failures) {
         fprintf(stderr, "vdp_render_diff_test failed: %d mismatches\n", failures);
         return 1;
     }
-    printf("vdp_render_diff_test passed: directed, 4000 random, odd-canvas, and import-sequence cases matched\n");
+    printf("vdp_render_diff_test passed: directed, 4000 random, odd-canvas, import-sequence and 1500 crowded-sprite cases matched\n");
     return 0;
 }

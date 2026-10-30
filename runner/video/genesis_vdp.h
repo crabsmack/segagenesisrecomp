@@ -255,6 +255,70 @@ void gvdp_set_ws_bar_black(int black);
 /* Active output width including widescreen margins (the armed canvas when set,
  * else screen_width + 2*extra). */
 int  gvdp_active_width(const GVDP *v);
+/* In widescreen, the per-line sprite pixel budget: 1 = the authentic screen
+ * width (320 in H40, the hardware's limit, so a widened view drops exactly the
+ * sprites the 4:3 view drops for the same table), 0 (default) = the output
+ * width (the margins and pillarbox widen the budget). No effect without a
+ * margin or canvas. Presentation parameter, outside the VDP struct. */
+void gvdp_set_ws_authentic_sprite_budget(int on);
+
+/* Widescreen margin columns for 2-cell (per-16-px column) vertical scroll.
+ * VSRAM holds the columns of the authentic window only (20 in H40, 16 in H32);
+ * a margin column is drawn with the nearest edge column's value (the clamp)
+ * unless the host fills it here. Columns are numbered in screen space,
+ * col = floor(x / 16): -1 is x -16..-1, 20 is x 320..335 in H40 (16 in H32),
+ * so a 40-px margin draws columns -3..-1 and 20..22. Values are VSRAM words
+ * (plane A, plane B; 11 bits kept). A filled column keeps its value until set
+ * again or cleared, like VSRAM: a host that widens an H-int raster sets it
+ * between lines where the raster rewrites VSRAM (the scanline renders after
+ * the line's interrupt work). Presentation only, outside the VDP struct.
+ * Returns 0 (nothing set) for col outside GVDP_WS_VCOL_FIRST..LAST. */
+#define GVDP_WS_VCOL_SIDE   8          /* per side: the widest margin (128 px, H32) / 16 */
+#define GVDP_WS_VCOL_FIRST  (-GVDP_WS_VCOL_SIDE)                 /* -8 */
+#define GVDP_WS_VCOL_LAST   (320 / 16 - 1 + GVDP_WS_VCOL_SIDE)   /* 27 */
+int  gvdp_set_ws_vscroll_column(int col, uint16_t vs_a, uint16_t vs_b);
+void gvdp_clear_ws_vscroll_column(int col);
+void gvdp_clear_ws_vscroll_columns(void);
+
+/* Host sprite table: entries a host draws past the hardware's 80 (64 in H32),
+ * as if linked after the SAT chain's last entry, in array order (the link
+ * byte is ignored). Same rules as SAT sprites: Y/size/name/attributes/X in the
+ * SAT's own format (y and x include the +128 origin; 10-bit x as above),
+ * priority, shadow/highlight operators, the x=0 masking state carried from
+ * the SAT sprites of the same line, and the per-line count and pixel limits
+ * unless gvdp_set_unlimited_sprites is on (a line the SAT already filled
+ * draws none). Drawn into the hardware sprite layer before the host-sprite
+ * callback. Never raises the overflow or collision status bits (presentation
+ * only). The list is copied; it stays until set again (count 0 clears).
+ * Returns 0 (list unchanged) for count > GVDP_HOST_SAT_MAX. */
+#define GVDP_HOST_SAT_MAX 256
+typedef struct GVDPHostSat {
+    uint16_t y;        /* SAT word 0: y + 128 (+256 in interlace mode 2)     */
+    uint8_t  size;     /* SAT byte 2: (width-1) << 2 | (height-1), in cells   */
+    uint8_t  link;     /* SAT byte 3: ignored (array order is link order)    */
+    uint16_t attr;     /* SAT word 2: priority, palette, flips, pattern      */
+    uint16_t x;        /* SAT word 3: x + 128                                 */
+} GVDPHostSat;
+int      gvdp_set_host_sat(const GVDPHostSat *list, unsigned count);
+unsigned gvdp_host_sat_count(void);
+
+/* Render counters (presentation, cumulative since the last reset; outside
+ * the VDP struct). A sprite "on a line" is one whose rows cover it, counted
+ * in link order over the SAT chain then the host table, on screen or not (off
+ * screen sprites take part in the hardware limits too). */
+typedef struct GVDPStats {
+    uint64_t sprite_lines;            /* sprite lines evaluated                     */
+    uint64_t sprite_drop_lines;       /* lines on which a limit dropped a sprite    */
+    uint64_t sprite_drops_count;      /* sprites on a line past the 20th (16th H32) */
+    uint64_t sprite_drops_pixels;     /* sprites within the count cut short or not
+                                         drawn because the line's pixel budget ran out */
+    uint64_t host_sat_sprites;        /* host-table sprites drawn on a line         */
+    uint64_t ws_margin_columns;       /* 2-cell V-scroll margin columns drawn, per line */
+    uint64_t ws_edge_clamped_columns; /* of those, drawn with the edge clamp (not filled) */
+} GVDPStats;
+void gvdp_get_stats(GVDPStats *out);
+void gvdp_reset_stats(void);
+
 /* Diagnostic: force Plane B hscroll constant (line 0) + mark its wrap column. */
 void gvdp_set_bgdiag(int on);
 int gvdp_display_enabled(const GVDP *v);
