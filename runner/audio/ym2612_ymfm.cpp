@@ -56,6 +56,8 @@ struct YmfmIface : public ymfm::ymfm_interface {};
 
 YmfmIface       s_iface;
 ymfm::ym2612   *s_chip = nullptr;
+ymfm::ym3438   *s_chip_3438 = nullptr;   /* ym2612_set_model(1): s_chip as the YM3438 (generate() isn't virtual) */
+int             s_model = 0;             /* 0 the YM2612, 1 the YM3438 */
 int             s_inited = 0;
 
 /* Output scratch ring, mirroring ym2612.c's so ym2612_render semantics match. */
@@ -100,7 +102,8 @@ void emit_one_sample() {
         return;
     }
     ymfm::ym2612::output_data out;
-    s_chip->generate(&out, 1);
+    if (s_chip_3438) s_chip_3438->generate(&out, 1);
+    else s_chip->generate(&out, 1);
     int32_t l = out.data[0] * YM_GAIN_NUM / YM_GAIN_DEN;
     int32_t r = out.data[1] * YM_GAIN_NUM / YM_GAIN_DEN;
     s_scratch[s_scratch_write * 2 + 0] = (int16_t)fm_lpf(0, l);   /* hardware FM output LPF (matches reference; tames ymfm's excess highs) */
@@ -111,14 +114,30 @@ void emit_one_sample() {
 } /* namespace */
 
 extern "C" void ym2612_init(void) {
-    if (!s_chip)
-        s_chip = new ymfm::ym2612(s_iface);
+    if (!s_chip) {
+        if (s_model) s_chip = s_chip_3438 = new ymfm::ym3438(s_iface);
+        else s_chip = new ymfm::ym2612(s_iface);    }
     s_chip->reset();
     s_scratch_write = s_scratch_read = 0;
     s_master_accum = 0;
     s_fm_lpf_prev[0] = s_fm_lpf_prev[1] = 0;
     s_fm_lpf_out[0]  = s_fm_lpf_out[1]  = 0;
     s_inited = 1;
+}
+
+/* The chip modelled: 0 the YM2612 (the default), 1 the YM3438, the same chip without the YM2612's
+ * DAC ladder distortion (ymfm::ym3438). Set before the first sound; a change after the chip exists
+ * makes a new one (reset, its state lost). */
+extern "C" void ym2612_set_model(int model) {
+    model = model ? 1 : 0;
+    if (model == s_model) return;
+    s_model = model;
+    if (!s_chip) return;
+    if (s_chip_3438) delete s_chip_3438;
+    else delete s_chip;
+    s_chip = nullptr;
+    s_chip_3438 = nullptr;
+    if (s_inited) ym2612_init();
 }
 
 extern "C" void ym2612_advance(uint32_t cycles_master) {

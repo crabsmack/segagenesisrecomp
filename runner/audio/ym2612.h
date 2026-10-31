@@ -18,6 +18,10 @@
 /* Lifecycle */
 void ym2612_init(void);
 
+/* The chip modelled: 0 the YM2612 (the default), 1 the YM3438 (no DAC ladder distortion). Set it
+ * before the first sound; a change after makes a new chip (reset). */
+void ym2612_set_model(int model);
+
 /* Advance internal state by `cycles_68k` 68K cycles without any register
  * writes. Ticks envelope/phase/LFO for each operator. */
 void ym2612_advance(uint32_t cycles_68k);
